@@ -20,7 +20,7 @@ PROMPTS = {
 }
 
 
-def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None):
+def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None, extra_args=()):
     os.makedirs(out, exist_ok=True)
     lines = []
     for name, prompt in PROMPTS.items():
@@ -33,7 +33,7 @@ def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None):
             env["DS4_ROUTE_PREFETCH"] = str(prefetch)
         env.update(extra_env or {})
         cmd = [DS4, "--cuda", "-m", MODEL, "--ssd-streaming", "--ctx", "4096", "--nothink",
-               "--temp", "0", "--seed", "12345", "-n", str(tokens), "-p", prompt]
+               "--temp", "0", "--seed", "12345", "-n", str(tokens), *extra_args, "-p", prompt]
         with open(f"{out}/{name}.stdout", "w") as so, open(f"{out}/{name}.stderr", "w") as se:
             rc = subprocess.run(cmd, stdout=so, stderr=se, env=env).returncode
         size = os.path.getsize(f"{out}/{name}.trace") if os.path.exists(f"{out}/{name}.trace") else 0

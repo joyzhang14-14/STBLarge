@@ -35419,16 +35419,14 @@ static int cuda_stream_selected_cache_begin_load_tensor(
         (void)cuda_stream_prefetch_start(table, &g_route_predict.next, predicted,
                                          std::min<uint32_t>((uint32_t)prefetch_k, n_predicted));
     const uint32_t stbl_k = (uint32_t)stbl_prefetch_k();
-    if (rc && stbl_k) {
-        if (n_predicted) stbl_pf_issue(&g_route_predict.next, predicted, std::min(stbl_k, n_predicted));
-        static int k2 = -1;
-        if (k2 < 0) {
-            const char *v = getenv("DS4_STBL_PREFETCH2");
-            k2 = v ? std::max(0, std::min(atoi(v), STBL_PREDICT_RANK)) : (int)stbl_k;
-        }
-        if (has_next2 && n_predicted2 && k2)
-            stbl_pf_issue(&next2, predicted2, std::min((uint32_t)k2, n_predicted2));
+    static int k2 = -1;
+    if (k2 < 0) {
+        const char *v = getenv("DS4_STBL_PREFETCH2");
+        k2 = v ? std::max(0, std::min(atoi(v), STBL_PREDICT_RANK)) : (int)stbl_k;
     }
+    if (rc && stbl_k && n_predicted) stbl_pf_issue(&g_route_predict.next, predicted, std::min(stbl_k, n_predicted));
+    if (rc && k2 && has_next2 && n_predicted2)
+        stbl_pf_issue(&next2, predicted2, std::min((uint32_t)k2, n_predicted2));
     if (g_stbl_timing.on) {
         const double t3 = cuda_wall_sec();
         g_stbl_timing.ids += t0 - t_ids;
