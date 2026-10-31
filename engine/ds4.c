@@ -23320,29 +23320,6 @@ static bool metal_graph_decode_selected_readahead_override(
     return true;
 }
 
-/* STBLarge shadow predictor (DS4_ROUTE_PREDICT): at layer il, run layer il+1's router on the
- * router input of layer il and record the top-k it would pick. Logging only; routing is unchanged. */
-static void stbl_shadow_predict(ds4_gpu_graph *g, const ds4_model *model,
-                                const ds4_layer_weights *layer, uint32_t il, bool sync) {
-    if (il + 1 >= DS4_N_LAYER) return;
-    const ds4_layer_weights *next = layer + 1;
-    if (next->ffn_gate_tid2eid || !next->ffn_gate_inp) return;
-    /* sync: commands are still being recorded; finish them so ffn_norm is readable. */
-    if (sync && ds4_gpu_end_commands() == 0) return;
-    const bool read_ok = ds4_gpu_tensor_read(metal_graph_ffn_norm(g), 0, g->cpu_router_norm,
-                            (uint64_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0])) != 0;
-    if (sync && ds4_gpu_begin_commands() == 0) return;
-    if (!read_ok) return;
-    float logits[DS4_MAX_EXPERT], probs[DS4_MAX_EXPERT], weights[DS4_MAX_EXPERT_USED];
-    int selected[DS4_MAX_EXPERT_USED];
-    int32_t ids[DS4_MAX_EXPERT_USED];
-    matvec_any(logits, model, next->ffn_gate_inp, g->cpu_router_norm);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) probs[i] = sqrtf(softplus_stable(logits[i]));
-    layer_topk_selected_experts_from_probs(selected, weights, model, next, probs);
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) ids[i] = (int32_t)selected[i];
-    ds4_gpu_route_trace_predict(il + 1, ids, DS4_N_EXPERT_USED);
-}
-
 static bool metal_graph_decode_cuda_selected_load(
         ds4_gpu_graph            *g,
         const ds4_model          *model,
@@ -23375,7 +23352,6 @@ static bool metal_graph_decode_cuda_selected_load(
                                   (uint64_t)DS4_N_EXPERT_USED *
                                       sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
-    if (ok && getenv("DS4_ROUTE_PREDICT")) stbl_shadow_predict(g, model, layer, il, false);
 
     if (ok) {
         const ds4_gpu_stream_expert_table table =
@@ -27030,8 +27006,6 @@ static bool metal_graph_encode_decode_layer_phase(
                             DS4_N_EXPERT_USED) != 0;
             }
         }
-        if (ok && g->ssd_streaming && getenv("DS4_ROUTE_PREDICT"))
-            stbl_shadow_predict(g, model, layer, il, true);
         if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                      metal_graph_routed_gate(g),
                                                      metal_graph_routed_up(g),
@@ -40982,6 +40956,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(route_logits, DS4_N_EXPERT) X(route_probs, DS4_N_EXPERT) \
     X(selected, DS4_N_EXPERT_USED) X(route_weights, DS4_N_EXPERT_USED) \
     X(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
+    X(pred_logits, DS4_N_EXPERT) X(pred_probs, DS4_N_EXPERT) \
+    X(pred_selected, DS4_N_EXPERT_USED) X(pred_weights, DS4_N_EXPERT_USED) \
     X(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP) X(mid, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(experts, DS4_N_EXPERT_USED * DS4_N_EMBD) X(routed, DS4_N_EMBD) \
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
@@ -41637,6 +41613,20 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    /* STBLarge (DS4_ROUTE_PREDICT): run layer il+1's router on this layer's router input.
+     * The result only informs the SSD expert cache; routing of every layer is unchanged. */
+    static int predict = -1;
+    if (predict < 0) predict = getenv("DS4_ROUTE_PREDICT") != NULL;
+    if (predict && g->streaming && g->tp_world == 1 && il + 1 < DS4_N_LAYER) {
+        const ds4_layer_weights *n = l + 1;
+        const ds4_tensor *nb = ds41_image_at(g, g->pos) ? n->ffn_exp_probs_vl : n->ffn_exp_probs_b;
+        if (nb && ds41_matmul(g->pred_logits, m, n->ffn_gate_inp, g->norm, false) &&
+            ds4_gpu_router_select_tensor(g->pred_selected, g->pred_weights, g->pred_probs,
+                m->map, m->size, nb->abs_offset, 0, 0, token,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+                g->pred_logits))
+            ds4_gpu_route_predict_pending(g->pred_selected, il + 1, DS4_N_EXPERT_USED);
+    }
 #ifdef DS4_ROCM_BUILD
     if (g->streaming) {
         const ds4_gpu_stream_expert_table table = {

@@ -29028,12 +29028,29 @@ static void cuda_route_trace_open(void) {
     }
 }
 
-/* STBLarge: a predicted expert set for an upcoming layer, written as "p <layer> <id> ...". */
-extern "C" void ds4_gpu_route_trace_predict(uint32_t layer, const int32_t *ids, uint32_t n) {
+/* STBLarge: the graph queues a predicted expert set for the next layer; the streamed load of the
+ * current layer reads it back together with the selected ids and records "p <layer> <id> ...". */
+static const ds4_gpu_tensor *g_route_predict_tensor;
+static uint32_t g_route_predict_layer, g_route_predict_n;
+
+extern "C" void ds4_gpu_route_predict_pending(const ds4_gpu_tensor *selected, uint32_t layer, uint32_t n) {
+    g_route_predict_tensor = selected;
+    g_route_predict_layer = layer;
+    g_route_predict_n = n;
+}
+
+static void cuda_route_predict_take(void) {
+    const ds4_gpu_tensor *t = g_route_predict_tensor;
+    g_route_predict_tensor = NULL;
+    if (!t || g_route_predict_n == 0 || g_route_predict_n > 64 ||
+        t->bytes < (uint64_t)g_route_predict_n * sizeof(int32_t)) return;
+    int32_t ids[64];
+    if (!cuda_ok(cudaMemcpy(ids, t->ptr, (size_t)g_route_predict_n * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost), "route predict read")) return;
     cuda_route_trace_open();
     if (!g_route_trace) return;
-    fprintf(g_route_trace, "p %u", layer);
-    for (uint32_t i = 0; i < n; i++) fprintf(g_route_trace, " %d", ids[i]);
+    fprintf(g_route_trace, "p %u", g_route_predict_layer);
+    for (uint32_t i = 0; i < g_route_predict_n; i++) fprintf(g_route_trace, " %d", ids[i]);
     fputc('\n', g_route_trace);
 }
 
@@ -34920,6 +34937,7 @@ static int cuda_stream_selected_cache_begin_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
+    cuda_route_predict_take();
     return cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected, order_reads);
 }
 
