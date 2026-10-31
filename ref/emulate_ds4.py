@@ -83,6 +83,7 @@ def head_forward(self, x, full_logits=False):
     return F.linear(q8_values(x.float(), False), self.weight)
 
 
+@torch.no_grad()
 def apply(model: torch.nn.Module):
     M.linear = linear
     M.ParallelHead.forward = head_forward
