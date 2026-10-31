@@ -29051,6 +29051,10 @@ static bool stbl_reader_ready(int n, uint64_t bytes) {
     return true;
 }
 
+/* Demand reads in flight; with DS4_STBL_PREFETCH_YIELD the prefetch readers wait for zero
+ * before each piece so they only use the SSD while the main thread is not waiting on it. */
+static std::atomic<int> g_stbl_demand{0};
+
 static int stbl_parallel_read(const std::vector<stbl_copy> &copies) {
     const int threads = stbl_read_threads();
     const uint64_t piece = UINT64_C(8) << 20;
@@ -29065,6 +29069,10 @@ static int stbl_parallel_read(const std::vector<stbl_copy> &copies) {
     if (cudaGetDevice(&device) != cudaSuccess) return 0;
     std::atomic<size_t> next{0};
     std::atomic<bool> ok{true};
+    struct demand_mark {
+        demand_mark() { g_stbl_demand.fetch_add(1); }
+        ~demand_mark() { g_stbl_demand.fetch_sub(1); }
+    } mark;
     auto work = [&](int w) {
         if (cudaSetDevice(device) != cudaSuccess) { ok = false; return; }
         int direct_fd = g_model_direct_fd;
@@ -29133,6 +29141,9 @@ struct stbl_route_predict {
     ds4_gpu_stream_expert_table next;
     uint32_t layer, n_used, n_expert;
     uint64_t checked, mismatched;
+    int32_t *host_ids;     /* pinned; filled by an async copy queued behind the select kernel */
+    cudaEvent_t copied;
+    bool async;
 };
 static stbl_route_predict g_route_predict, g_route_predict2;
 
@@ -29150,6 +29161,19 @@ extern "C" void ds4_gpu_route_predict_pending(const ds4_gpu_tensor *selected, co
     p.layer = layer;
     p.n_used = n_used;
     p.n_expert = n_expert;
+    p.async = false;
+    cuda_route_trace_open();
+    if (g_route_trace || n_used > STBL_PREDICT_RANK || selected->bytes < (uint64_t)n_used * sizeof(int32_t)) return;
+    if (!p.host_ids && (cudaMallocHost(&p.host_ids, STBL_PREDICT_RANK * sizeof(int32_t)) != cudaSuccess ||
+                        cudaEventCreateWithFlags(&p.copied, cudaEventDisableTiming) != cudaSuccess)) {
+        (void)cudaGetLastError();
+        p.host_ids = NULL;
+        return;
+    }
+    p.async = cudaMemcpyAsync(p.host_ids, selected->ptr, (size_t)n_used * sizeof(int32_t),
+                              cudaMemcpyDeviceToHost, cuda_decode_stream()) == cudaSuccess &&
+              cudaEventRecord(p.copied, cuda_decode_stream()) == cudaSuccess;
+    if (!p.async) (void)cudaGetLastError();
 }
 
 static void cuda_route_predict_report(void) {
@@ -29171,6 +29195,11 @@ static uint32_t cuda_route_predict_take(stbl_route_predict &p, const char *tag,
     int32_t gpu_ids[STBL_PREDICT_RANK];
     float score[1024];
     cuda_route_trace_open();
+    if (!g_route_trace && p.async) {
+        if (!cuda_ok(cudaEventSynchronize(p.copied), "route predict ids wait")) return 0;
+        memcpy(out, p.host_ids, (size_t)p.n_used * sizeof(int32_t));
+        return p.n_used;
+    }
     if (!g_route_trace) {
         if (!cuda_ok(cudaMemcpy(out, sel->ptr, (size_t)p.n_used * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost), "route predict ids read")) return 0;
@@ -29274,6 +29303,7 @@ static void stbl_pf_worker(int w) {
     }
     char *stage = (char *)cuda_align_ptr(raw, align);
     int direct_fd = g_model_direct_fd;
+    const bool yield = getenv("DS4_STBL_PREFETCH_YIELD") != NULL;
     for (;;) {
         stbl_job *j;
         {
@@ -29299,6 +29329,7 @@ static void stbl_pf_worker(int w) {
             for (uint64_t at = 0; ok && at < len[part]; at += piece) {
                 const uint64_t n = std::min(piece, len[part] - at);
                 const char *payload = NULL;
+                while (yield && g_stbl_demand.load() > 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
                 ok = cuda_model_stage_read_from(g_model_fd, &direct_fd, g_model_direct_align, g_model_file_size,
                          stage, piece + align, off[part] + at, n, &payload) &&
                      cudaMemcpyAsync(dst[part] + at, payload, (size_t)n, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
