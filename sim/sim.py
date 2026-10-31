@@ -10,14 +10,33 @@ N_LAYER = 40
 
 
 def load(path):
-    recs = []
+    """预测行「p 层号 专家…」挂到同一层接下来的那条记录上（r["pred"]）。"""
+    recs, pending = [], {}
     for line in open(path):
         f = line.split()
+        if f and f[0] == "p":
+            pending[int(f[1])] = [int(x) for x in f[2:]]
+            continue
         if len(f) < 4:
             continue
         recs.append({"t": int(f[0]), "layer": int(f[1]), "slots": int(f[2]),
-                     "ids": [int(x[:-1]) for x in f[3:]], "hit": [x[-1] == "h" for x in f[3:]]})
+                     "ids": [int(x[:-1]) for x in f[3:]], "hit": [x[-1] == "h" for x in f[3:]],
+                     "pred": pending.pop(int(f[1]), None)})
     return recs
+
+
+def pred_recall(steps):
+    """影子预测每层猜中的比例：|预测 ∩ 实际| / 实际个数。返回 {层: 比例} 和总体比例。"""
+    hit, tot = collections.Counter(), collections.Counter()
+    for s in steps:
+        if s["kind"] == "prefill":
+            continue
+        for r in s["recs"]:
+            if r.get("pred") is not None:
+                hit[r["layer"]] += len(set(r["pred"]) & set(r["ids"]))
+                tot[r["layer"]] += len(r["ids"])
+    per = {L: hit[L] / tot[L] for L in sorted(tot)}
+    return per, (sum(hit.values()) / sum(tot.values()) if tot else None)
 
 
 def split_steps(recs, prefill_tokens=0):
@@ -146,6 +165,7 @@ def run(steps, cap, policy="lru", predictor=None, k=6, trans=None, pin=(), looka
 
     predictor：
       transition  用训练轨迹的层间共现，在第 L 层路由后预取第 L+1 层最可能的 k 个专家
+      shadow      引擎记录的影子预测（下一层路由器套在本层路由器输入上）
       oracle      预知下一层（上限）
       token-oracle 预知 lookahead 个 token 之后整步要用的专家（上限）
     pin：常驻不淘汰的 (层, 专家) 集合，占用缓存容量。
@@ -173,9 +193,12 @@ def run(steps, cap, policy="lru", predictor=None, k=6, trans=None, pin=(), looka
                 if not cache.touch(key) and gen:
                     demand += 1
                     step_miss += 1
-            if L + 1 >= N_LAYER or predictor not in ("transition", "oracle"):
+            if L + 1 >= N_LAYER or predictor not in ("transition", "oracle", "shadow"):
                 continue
-            if predictor == "oracle":
+            if predictor == "shadow":
+                nxt = [x for x in s["recs"] if x["layer"] == L + 1]
+                guess = (nxt[0].get("pred") or [])[:k] if nxt else []
+            elif predictor == "oracle":
                 nxt = [x for x in s["recs"] if x["layer"] == L + 1]
                 guess = nxt[0]["ids"][:k] if nxt else []
             else:

@@ -30,6 +30,7 @@ CASES = [
                                                    trans=sim.train_transitions(tr))),
     ("LRU + 层间共现预测 k=12", lambda tr, cap: dict(policy="lru", predictor="transition", k=12,
                                                     trans=sim.train_transitions(tr))),
+    ("LRU + 影子预测（下一层路由器）", lambda tr, cap: dict(policy="lru", predictor="shadow")),
     ("LRU + 预知下一层（上限）", lambda tr, cap: dict(policy="lru", predictor="oracle")),
     ("LRU + 预知下 1 个 token（上限）", lambda tr, cap: dict(policy="lru", predictor="token-oracle", lookahead=1)),
     ("LRU + 预知下 5 个 token（上限）", lambda tr, cap: dict(policy="lru", predictor="token-oracle", lookahead=5)),
@@ -56,7 +57,8 @@ for name, d in data.items():
     rows["理论最优淘汰（Belady）"] = {"hit_rate": 1 - bel / acc, "demand_misses": bel, "prefetch_reads": 0,
                                  "ms_serial": sim.est_ms([(bel / len(gen), 0)] * len(gen), cal, False),
                                  "ms_overlap": None}
-    out["prompts"][name] = {"calibration": cal, "measured_tps": d["tps"], "gen_steps": len(gen), "rows": rows}
+    per_layer, recall = sim.pred_recall(steps)
+    out["prompts"][name] = {"pred_recall": recall, "pred_recall_per_layer": per_layer, "calibration": cal, "measured_tps": d["tps"], "gen_steps": len(gen), "rows": rows}
     for label, r in rows.items():
         g = agg.setdefault(label, {"hit": [], "miss_tok": [], "pf_tok": [], "ser": [], "ovl": []})
         g["hit"].append(r["hit_rate"]); g["miss_tok"].append(r["demand_misses"] / len(gen))
@@ -69,7 +71,8 @@ print(f"{len(data)} 个提示词，缓存 {a.cache} 个专家")
 for name, p in out["prompts"].items():
     c = p["calibration"]
     print(f"  {name:14s} 实测 {p['measured_tps']} tok/s，每步 {c['step_ms']:.1f} ms，每层计算 {c['layer_compute_ms']:.2f} ms，"
-          f"读一个专家 {c['miss_ms']:.2f} ms，每步缺失 {c['misses_per_step']:.1f}")
+          f"读一个专家 {c['miss_ms']:.2f} ms，每步缺失 {c['misses_per_step']:.1f}"
+          + (f"，影子预测猜中 {p['pred_recall'] * 100:.1f}%" if p["pred_recall"] is not None else ""))
 print(f"{'情况':30s} {'命中率':>7s} {'缺失/token':>9s} {'预取/token':>9s} {'串行 tok/s':>10s} {'重叠 tok/s':>10s}")
 summary = {}
 for label, g in agg.items():
