@@ -427,7 +427,8 @@ int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
-void ds4_gpu_route_predict_pending(const ds4_gpu_tensor *selected, uint32_t layer, uint32_t n);
+void ds4_gpu_route_predict_pending(const ds4_gpu_tensor *selected, const ds4_gpu_tensor *probs,
+                                   const float *bias, uint32_t layer, uint32_t n_used, uint32_t n_expert);
 int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,

@@ -29030,27 +29030,63 @@ static void cuda_route_trace_open(void) {
 
 /* STBLarge: the graph queues a predicted expert set for the next layer; the streamed load of the
  * current layer reads it back together with the selected ids and records "p <layer> <id> ...". */
-static const ds4_gpu_tensor *g_route_predict_tensor;
-static uint32_t g_route_predict_layer, g_route_predict_n;
+static struct {
+    const ds4_gpu_tensor *selected, *probs;
+    const float *bias;
+    uint32_t layer, n_used, n_expert;
+    uint64_t checked, mismatched;
+} g_route_predict;
 
-extern "C" void ds4_gpu_route_predict_pending(const ds4_gpu_tensor *selected, uint32_t layer, uint32_t n) {
-    g_route_predict_tensor = selected;
-    g_route_predict_layer = layer;
-    g_route_predict_n = n;
+#define STBL_PREDICT_RANK 12
+
+extern "C" void ds4_gpu_route_predict_pending(const ds4_gpu_tensor *selected, const ds4_gpu_tensor *probs,
+                                              const float *bias, uint32_t layer, uint32_t n_used,
+                                              uint32_t n_expert) {
+    g_route_predict.selected = selected;
+    g_route_predict.probs = probs;
+    g_route_predict.bias = bias;
+    g_route_predict.layer = layer;
+    g_route_predict.n_used = n_used;
+    g_route_predict.n_expert = n_expert;
 }
 
+static void cuda_route_predict_report(void) {
+    if (g_route_predict.checked)
+        fprintf(stderr, "ds4: STBLarge route predict: %llu layers, host top-k differs from GPU select in %llu\n",
+                (unsigned long long)g_route_predict.checked, (unsigned long long)g_route_predict.mismatched);
+}
+
+/* Read the queued prediction back and record the top STBL_PREDICT_RANK experts by
+ * selection score (prob + bias, as the router ranks them) as "p <layer> <id> ...". */
 static void cuda_route_predict_take(void) {
-    const ds4_gpu_tensor *t = g_route_predict_tensor;
-    g_route_predict_tensor = NULL;
-    if (!t || g_route_predict_n == 0 || g_route_predict_n > 64 ||
-        t->bytes < (uint64_t)g_route_predict_n * sizeof(int32_t)) return;
-    int32_t ids[64];
-    if (!cuda_ok(cudaMemcpy(ids, t->ptr, (size_t)g_route_predict_n * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost), "route predict read")) return;
+    auto &p = g_route_predict;
+    const ds4_gpu_tensor *sel = p.selected;
+    p.selected = NULL;
+    if (!sel || !p.probs || !p.bias || p.n_used == 0 || p.n_used > STBL_PREDICT_RANK ||
+        p.n_expert == 0 || p.n_expert > 1024 ||
+        sel->bytes < (uint64_t)p.n_used * sizeof(int32_t) ||
+        p.probs->bytes < (uint64_t)p.n_expert * sizeof(float)) return;
+    int32_t gpu_ids[STBL_PREDICT_RANK];
+    float score[1024];
+    if (!cuda_ok(cudaMemcpy(gpu_ids, sel->ptr, (size_t)p.n_used * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost), "route predict ids read") ||
+        !cuda_ok(cudaMemcpy(score, p.probs->ptr, (size_t)p.n_expert * sizeof(float),
+                            cudaMemcpyDeviceToHost), "route predict probs read")) return;
+    for (uint32_t i = 0; i < p.n_expert; i++) score[i] += p.bias[i];
+    int32_t order[1024];
+    for (uint32_t i = 0; i < p.n_expert; i++) order[i] = (int32_t)i;
+    const uint32_t k = std::min<uint32_t>(STBL_PREDICT_RANK, p.n_expert);
+    std::partial_sort(order, order + k, order + p.n_expert,
+                      [&](int32_t a, int32_t b) { return score[a] > score[b] || (score[a] == score[b] && a < b); });
+    std::vector<int32_t> top(order, order + p.n_used), gpu(gpu_ids, gpu_ids + p.n_used);
+    std::sort(top.begin(), top.end());
+    std::sort(gpu.begin(), gpu.end());
+    if (p.checked++ == 0) atexit(cuda_route_predict_report);
+    if (top != gpu) p.mismatched++;
     cuda_route_trace_open();
     if (!g_route_trace) return;
-    fprintf(g_route_trace, "p %u", g_route_predict_layer);
-    for (uint32_t i = 0; i < g_route_predict_n; i++) fprintf(g_route_trace, " %d", ids[i]);
+    fprintf(g_route_trace, "p %u", p.layer);
+    for (uint32_t i = 0; i < k; i++) fprintf(g_route_trace, " %d", order[i]);
     fputc('\n', g_route_trace);
 }
 

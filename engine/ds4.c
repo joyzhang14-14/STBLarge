@@ -41625,7 +41625,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                 m->map, m->size, nb->abs_offset, 0, 0, token,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
                 g->pred_logits))
-            ds4_gpu_route_predict_pending(g->pred_selected, il + 1, DS4_N_EXPERT_USED);
+            ds4_gpu_route_predict_pending(g->pred_selected, g->pred_probs,
+                (const float *)tensor_data(m, nb), il + 1, DS4_N_EXPERT_USED, DS4_N_EXPERT);
     }
 #ifdef DS4_ROCM_BUILD
     if (g->streaming) {
