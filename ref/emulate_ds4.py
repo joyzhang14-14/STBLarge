@@ -20,15 +20,32 @@ import model as M
 _linear = M.linear
 
 
-def q8_values(x: torch.Tensor, fp16_scale: bool) -> torch.Tensor:
-    """Round to int8 per 32 along the last dim with scale amax/127 (scale kept fp16 for weights)."""
-    shape = x.shape
-    b = x.float().reshape(-1, shape[-1] // 32, 32)
+def q8_codes(x: torch.Tensor, fp16_scale: bool):
+    """int8 codes and scales per 32 along the last dim, scale amax/127 (fp16 for weights)."""
+    b = x.float().reshape(-1, x.shape[-1] // 32, 32)
     d = b.abs().amax(-1, keepdim=True) / 127.0
     if fp16_scale:
         d = d.half().float()
-    q = torch.where(d > 0, torch.round(b / torch.where(d > 0, d, torch.ones_like(d))), torch.zeros_like(b))
-    return (q.clamp(-128, 127) * d).reshape(shape)
+    q = torch.round(b / torch.where(d > 0, d, torch.ones_like(d))).clamp(-128, 127)
+    return q.to(torch.int8), d
+
+
+def q8_values(x: torch.Tensor, fp16_scale: bool) -> torch.Tensor:
+    q, d = q8_codes(x, fp16_scale)
+    return (q.float() * d).reshape(x.shape)
+
+
+def q8_weight(linear: torch.nn.Module):
+    """Q8_0 of an FP8 linear's dequantized weight, a block of rows at a time to bound memory."""
+    n, k = linear.weight.shape
+    codes = torch.empty(n, k, dtype=torch.int8, device=linear.weight.device)
+    scales = torch.empty(n, k // 32, dtype=torch.float16, device=linear.weight.device)
+    for r in range(0, n, 2048):
+        rows = slice(r, min(r + 2048, n))
+        w = linear.weight[rows].float() * linear.scale[r // 32:(rows.stop + 31) // 32].float().repeat_interleave(32, 0)[:rows.stop - r].repeat_interleave(32, 1)[:, :k]
+        q, d = q8_codes(w, True)
+        codes[rows], scales[rows] = q.view(-1, k), d.view(-1, k // 32).half()
+    return codes, scales
 
 
 def fp8_weight(linear: torch.nn.Module) -> torch.Tensor:
@@ -44,10 +61,11 @@ def f16_roundtrip_(p: torch.Tensor):
 def linear(x, weight, bias=None):
     mode = getattr(weight, "ds4_mode", None)
     if mode == "q8":
-        y = q8_values(x, False) @ weight.ds4_w.t()
-        return y.to(torch.get_default_dtype())
+        n, k = weight.ds4_q.shape
+        w = (weight.ds4_q.float().view(n, -1, 32) * weight.ds4_d.float().unsqueeze(-1)).view(n, k)
+        return (q8_values(x, False) @ w.t()).to(torch.get_default_dtype())
     if mode == "plain":
-        return (x.float() @ weight.ds4_w.t()).to(torch.get_default_dtype())
+        return (x.float() @ weight.ds4_w.float().t()).to(torch.get_default_dtype())
     if weight.dtype == torch.float4_e2m1fn_x2:
         import kernel as K
         n, half_k = weight.shape
@@ -70,14 +88,16 @@ def apply(model: torch.nn.Module):
     M.ParallelHead.forward = head_forward
     for name, mod in model.named_modules():
         if isinstance(mod, M.Linear) and mod.weight.dtype == torch.float8_e4m3fn:
-            w = fp8_weight(mod)
             if name.endswith(("engram.wkv", "indexer.wq_b")):
-                mod.weight.ds4_mode, mod.weight.ds4_w = "plain", w.half().float()
+                mod.weight.ds4_mode, mod.weight.ds4_w = "plain", fp8_weight(mod).half()
             else:
-                mod.weight.ds4_mode, mod.weight.ds4_w = "q8", q8_values(w, True)
+                mod.weight.ds4_mode = "q8"
+                mod.weight.ds4_q, mod.weight.ds4_d = q8_weight(mod)
         elif name.endswith("attn.wo_a"):
             mod.weight.data.copy_(q8_values(mod.weight.float(), True).to(mod.weight.dtype))
-    model.head.weight.data.copy_(q8_values(model.head.weight.data, True))
+    head = model.head.weight.data
+    for r in range(0, head.size(0), 8192):
+        head[r:r + 8192] = q8_values(head[r:r + 8192], True)
     f16_roundtrip_(model.embed.weight)
     for name, p in model.named_parameters():
         if (name.endswith(("hc_attn_fn", "hc_ffn_fn")) or ".compressor.wkv." in name or ".compressor.wgate." in name
