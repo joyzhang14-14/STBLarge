@@ -8,6 +8,7 @@ LRU, and Engram table rows are read from the files on lookup. Text only (vision 
 usage: run_ref.py OUT.pt --prompt TEXT [--system TEXT] [--tokens N] [--ctx N] | --ids 1,2,3
 Writes prompt ids, generated ids and per-step fp32 logits (greedy decoding).
 STBL_REF_EMULATE=ds4 swaps in the ds4 GGUF engine's numerics (emulate_ds4.py) for comparison.
+STBL_REF_DUMP=FILE saves the residual stream after every block, [tokens, layers, hc*dim] bf16.
 """
 
 import argparse
@@ -203,6 +204,11 @@ def main():
     print(f"ref: {n} dense tensors loaded in {time.time() - t0:.0f}s, "
           f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB on GPU, prompt {len(ids)} tokens", flush=True)
 
+    dump_path, dumped = os.environ.get("STBL_REF_DUMP"), []
+    if dump_path:  # residual stream after every block, as [tokens, layers, hc * dim] bf16
+        for layer in model.layers:
+            layer.register_forward_hook(lambda mod, inp, out: dumped.append(out[0][0].flatten(-2).to(torch.bfloat16).cpu()))
+
     tokens = torch.tensor([ids], dtype=torch.long)
     out_ids, logits_all = [], []
     pos, cur = 0, tokens
@@ -220,6 +226,10 @@ def main():
             break
     torch.save({"prompt_ids": ids, "ids": out_ids, "logits": torch.stack(logits_all),
                 "text": tokenizer.decode(out_ids)}, a.out)
+    if dump_path:
+        n_layers = len(model.layers)
+        calls = [torch.stack(dumped[i:i + n_layers], dim=1) for i in range(0, len(dumped), n_layers)]
+        torch.save(torch.cat(calls), dump_path)
     print("ref: text", repr(tokenizer.decode(out_ids)))
 
 
