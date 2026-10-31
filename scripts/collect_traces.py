@@ -5,7 +5,7 @@
 """
 import json, os, subprocess, sys
 
-DS4 = os.environ.get("STBL_DS4", "/home/joyzhang14/apps/ds4-stblarge/ds4")
+DS4 = os.environ.get("STBL_DS4", "/home/joyzhang14/apps/STBLarge/engine/ds4")
 MODEL = os.environ.get("STBL_MODEL", "/home/joyzhang14/models/ds4-gguf/DeepSeek-V4.1-Flash-1017-MXFP4-experts.gguf")
 PROMPTS = {
     "c-hashtable": "Write a complete C hash table implementation with string keys, insert, find, delete, and a test main. Output only C code.",
