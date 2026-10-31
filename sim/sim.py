@@ -173,10 +173,12 @@ def run(steps, cap, policy="lru", predictor=None, k=6, trans=None, pin=(), looka
     cache = (LFU if policy == "lfu" else LRU)(cap - len(pin))
     pinned = set(pin)
     accesses = demand = prefetch_reads = 0
-    per_step = []
+    per_step, per_layer = [], []
+    issued = {}  # 层 -> 为它预取、真的读了盘的专家（按预测名次）
     for si, s in enumerate(steps):
         gen = s["kind"] != "prefill"
         step_miss = step_pf = 0
+        layers = []
         if predictor == "token-oracle" and gen and si + lookahead < len(steps):
             for r in steps[si + lookahead]["recs"]:
                 for e in r["ids"]:
@@ -185,6 +187,7 @@ def run(steps, cap, policy="lru", predictor=None, k=6, trans=None, pin=(), looka
                         step_pf += 1
         for r in s["recs"]:
             L = r["layer"]
+            layer_miss = 0
             for e in r["ids"]:
                 key = (L, e)
                 accesses += gen
@@ -193,6 +196,10 @@ def run(steps, cap, policy="lru", predictor=None, k=6, trans=None, pin=(), looka
                 if not cache.touch(key) and gen:
                     demand += 1
                     step_miss += 1
+                    layer_miss += 1
+            got = issued.pop(L, [])
+            need = [i for i, e in enumerate(got) if e in r["ids"]]
+            layers.append((len(got), max(need) if need else -1, layer_miss))
             if L + 1 >= N_LAYER or predictor not in ("transition", "oracle", "shadow"):
                 continue
             if predictor == "shadow":
@@ -208,17 +215,36 @@ def run(steps, cap, policy="lru", predictor=None, k=6, trans=None, pin=(), looka
                 guess = [e2 for e2, _ in score.most_common(k)]
             for e2 in guess:
                 if (L + 1, e2) not in pinned and cache.prefetch((L + 1, e2)):
+                    issued.setdefault(L + 1, []).append(e2)
                     if gen:
                         prefetch_reads += 1
                         step_pf += 1
         if gen:
             per_step.append((step_miss, step_pf))
+            per_layer.append(layers)
     return {"accesses": accesses, "demand_misses": demand, "prefetch_reads": prefetch_reads,
-            "hit_rate": 1 - demand / accesses if accesses else None, "per_step": per_step}
+            "hit_rate": 1 - demand / accesses if accesses else None, "per_step": per_step,
+            "per_layer": per_layer}
+
+
+def est_layer_ms(per_layer, cal, cancel):
+    """按层估每步时间。第 L-1 层把第 L 层的预测交给后台读线程，读盘只能藏在约一层的计算时间里。
+
+    cancel=False：到第 L 层时等全部预取读完（ds4 现在的做法）；
+    cancel=True：只等第 L 层真正要用的那几个，猜错的取消。
+    之后再同步读预取没覆盖到的缺失。
+    """
+    c, b = cal["layer_compute_ms"], cal["miss_ms"]
+    tot = 0.0
+    for layers in per_layer:
+        for n_issued, last_needed, miss in layers:
+            reads = (last_needed + 1) if cancel else n_issued
+            tot += c + max(0.0, b * reads - c) + b * miss
+    return tot / len(per_layer) if per_layer else None
 
 
 def est_ms(per_step, cal, overlap):
-    """估每步时间。不重叠：40 × c + b ×（缺失 + 预取）；重叠：预取读盘在后台和计算并行，只有超出计算时间的部分计入。"""
+    """按整步粗估，偏乐观：把预取窗口当成整个 token 的计算时间。按层的估计见 est_layer_ms。"""
     C, b = N_LAYER * cal["layer_compute_ms"], cal["miss_ms"]
     tot = 0.0
     for miss, pf in per_step:

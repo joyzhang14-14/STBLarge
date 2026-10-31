@@ -52,8 +52,9 @@ for name, d in data.items():
     for label, kw in CASES:
         r = sim.run(steps, a.cache, **kw(train, a.cache))
         r["ms_serial"] = sim.est_ms(r["per_step"], cal, False)
-        r["ms_overlap"] = sim.est_ms(r["per_step"], cal, True)
-        r.pop("per_step")
+        r["ms_overlap"] = sim.est_layer_ms(r["per_layer"], cal, False)
+        r["ms_cancel"] = sim.est_layer_ms(r["per_layer"], cal, True)
+        r.pop("per_step"); r.pop("per_layer")
         rows[label] = r
     bel = sim.belady_misses(steps, a.cache)
     rows["理论最优淘汰（Belady）"] = {"hit_rate": 1 - bel / acc, "demand_misses": bel, "prefetch_reads": 0,
@@ -62,11 +63,12 @@ for name, d in data.items():
     per_layer, recall = sim.pred_recall(steps)
     out["prompts"][name] = {"pred_recall": recall, "pred_recall_per_layer": per_layer, "calibration": cal, "measured_tps": d["tps"], "gen_steps": len(gen), "rows": rows}
     for label, r in rows.items():
-        g = agg.setdefault(label, {"hit": [], "miss_tok": [], "pf_tok": [], "ser": [], "ovl": []})
+        g = agg.setdefault(label, {"hit": [], "miss_tok": [], "pf_tok": [], "ser": [], "ovl": [], "cnl": []})
         g["hit"].append(r["hit_rate"]); g["miss_tok"].append(r["demand_misses"] / len(gen))
         g["pf_tok"].append(r["prefetch_reads"] / len(gen))
         if r.get("ms_serial"): g["ser"].append(r["ms_serial"])
         if r.get("ms_overlap"): g["ovl"].append(r["ms_overlap"])
+        if r.get("ms_cancel"): g["cnl"].append(r["ms_cancel"])
 
 mean = lambda v: sum(v) / len(v) if v else None  # noqa: E731
 print(f"{len(data)} 个提示词，缓存 {a.cache} 个专家")
@@ -75,17 +77,18 @@ for name, p in out["prompts"].items():
     print(f"  {name:14s} 实测 {p['measured_tps']} tok/s，每步 {c['step_ms']:.1f} ms，每层计算 {c['layer_compute_ms']:.2f} ms，"
           f"读一个专家 {c['miss_ms']:.2f} ms，每步缺失 {c['misses_per_step']:.1f}"
           + (f"，前 6 名猜中 {p['pred_recall'] * 100:.1f}%" if p["pred_recall"] is not None else ""))
-print(f"{'情况':30s} {'命中率':>7s} {'缺失/token':>9s} {'预取/token':>9s} {'串行 tok/s':>10s} {'重叠 tok/s':>10s}")
+print(f"{'情况':30s} {'命中率':>7s} {'缺失/token':>9s} {'预取/token':>9s} {'串行 tok/s':>10s} {'等全部 tok/s':>10s} {'取消多余 tok/s':>10s}")
 summary = {}
 for label, g in agg.items():
-    ser, ovl = mean(g["ser"]), mean(g["ovl"])
+    ser, ovl, cnl = mean(g["ser"]), mean(g["ovl"]), mean(g["cnl"])
     summary[label] = {"hit_rate": mean(g["hit"]), "miss_per_token": mean(g["miss_tok"]),
                       "prefetch_per_token": mean(g["pf_tok"]),
-                      "tps_serial": 1000 / ser if ser else None, "tps_overlap": 1000 / ovl if ovl else None}
+                      "tps_serial": 1000 / ser if ser else None, "tps_overlap": 1000 / ovl if ovl else None,
+                      "tps_cancel": 1000 / cnl if cnl else None}
     s = summary[label]
     f = lambda v: f"{v:10.2f}" if v else "         -"  # noqa: E731
     print(f"{label:30s} {s['hit_rate'] * 100:6.1f}% {s['miss_per_token']:9.1f} {s['prefetch_per_token']:9.1f} "
-          f"{f(s['tps_serial'])} {f(s['tps_overlap'])}")
+          f"{f(s['tps_serial'])} {f(s['tps_overlap'])} {f(s['tps_cancel'])}")
 out["summary"] = summary
 if a.json:
     json.dump(out, open(a.json, "w"), ensure_ascii=False, indent=1)
