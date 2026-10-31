@@ -20,10 +20,11 @@ PROMPTS = {
 }
 
 
-def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None, extra_args=(), trace=True):
+def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None, extra_args=(), trace=True, prompts=None, dump=False):
     os.makedirs(out, exist_ok=True)
     lines = []
-    for name, prompt in PROMPTS.items():
+    prompts = prompts or PROMPTS
+    for name, prompt in prompts.items():
         if only and name not in only:
             continue
         env = dict(os.environ, DS4_ROUTE_TRACE=f"{out}/{name}.trace") if trace else dict(os.environ)
@@ -31,6 +32,8 @@ def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None, 
             env["DS4_ROUTE_PREDICT"] = "1"
         if prefetch:
             env["DS4_ROUTE_PREFETCH"] = str(prefetch)
+        if dump:
+            env["DS4_STBL_DUMP"] = f"{out}/{name}.dump"
         env.update(extra_env or {})
         cmd = [DS4, "--cuda", "-m", MODEL, "--ssd-streaming", "--ctx", "4096", "--nothink",
                "--temp", "0", "--seed", "12345", "-n", str(tokens), *extra_args, "-p", prompt]
@@ -38,7 +41,7 @@ def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None, 
             rc = subprocess.run(cmd, stdout=so, stderr=se, env=env).returncode
         size = os.path.getsize(f"{out}/{name}.trace") if os.path.exists(f"{out}/{name}.trace") else 0
         lines.append(f"{name}: 退出码 {rc}，轨迹 {size / 1e6:.1f} MB")
-    json.dump(PROMPTS, open(f"{out}/prompts.json", "w"), ensure_ascii=False, indent=1)
+    json.dump(prompts, open(f"{out}/prompts.json", "w"), ensure_ascii=False, indent=1)
     open(f"{out}/summary.txt", "w").write("\n".join(lines) + "\n")
     return lines
 
