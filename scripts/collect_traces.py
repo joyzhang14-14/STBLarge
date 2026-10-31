@@ -20,13 +20,13 @@ PROMPTS = {
 }
 
 
-def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None, extra_args=()):
+def main(out, predict=False, prefetch=0, only=None, tokens=256, extra_env=None, extra_args=(), trace=True):
     os.makedirs(out, exist_ok=True)
     lines = []
     for name, prompt in PROMPTS.items():
         if only and name not in only:
             continue
-        env = dict(os.environ, DS4_ROUTE_TRACE=f"{out}/{name}.trace")
+        env = dict(os.environ, DS4_ROUTE_TRACE=f"{out}/{name}.trace") if trace else dict(os.environ)
         if predict:
             env["DS4_ROUTE_PREDICT"] = "1"
         if prefetch:
