@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <atomic>
+#include <thread>
 #include "ds4_linux_memory.h"
 #include <unordered_map>
 #include <vector>
@@ -28994,6 +28995,97 @@ static int cuda_stream_selected_ranges_valid(
 
 /* The staging ring spans all misses in a request. Drain it before publishing
  * the request, or before any error return can release/reuse its destinations. */
+/* STBLarge: read expert byte ranges with several threads (DS4_STBL_READ_THREADS, 2..8).
+ * Each worker owns a pinned staging buffer and a copy stream; ranges are split into
+ * pieces of at most 8 MiB and handed out in order. Unset or 1 keeps the ds4 path. */
+struct stbl_copy {
+    char *dst;
+    uint64_t offset, bytes;
+};
+
+static int stbl_read_threads(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *v = getenv("DS4_STBL_READ_THREADS");
+        n = v ? std::max(1, std::min(atoi(v), 8)) : 1;
+    }
+    return n;
+}
+
+static struct {
+    void *raw[8];
+    char *stage[8];
+    cudaStream_t stream[8];
+    uint64_t bytes;
+    int n;
+} g_stbl_reader;
+
+static bool stbl_reader_ready(int n, uint64_t bytes) {
+    auto &r = g_stbl_reader;
+    if (r.n >= n && r.bytes >= bytes) return true;
+    for (int i = 0; i < r.n; i++) {
+        if (r.stream[i]) (void)cudaStreamDestroy(r.stream[i]);
+        if (r.raw[i]) (void)cudaFreeHost(r.raw[i]);
+        r.stream[i] = NULL;
+        r.raw[i] = NULL;
+        r.stage[i] = NULL;
+    }
+    r.n = 0;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    for (int i = 0; i < n; i++) {
+        if (cudaMallocHost(&r.raw[i], bytes + align) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&r.stream[i], cudaStreamNonBlocking) != cudaSuccess) {
+            (void)cudaGetLastError();
+            r.n = i + 1;
+            return false;
+        }
+        r.stage[i] = (char *)cuda_align_ptr(r.raw[i], align);
+        r.n = i + 1;
+    }
+    r.bytes = bytes;
+    return true;
+}
+
+static int stbl_parallel_read(const std::vector<stbl_copy> &copies) {
+    const int threads = stbl_read_threads();
+    const uint64_t piece = UINT64_C(8) << 20;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    std::vector<stbl_copy> jobs;
+    for (const auto &c : copies)
+        for (uint64_t at = 0; at < c.bytes; at += piece)
+            jobs.push_back({c.dst + at, c.offset + at, std::min(piece, c.bytes - at)});
+    if (jobs.empty()) return 1;
+    if (g_model_fd < 0 || !stbl_reader_ready(threads, piece + align)) return 0;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 0;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> ok{true};
+    auto work = [&](int w) {
+        if (cudaSetDevice(device) != cudaSuccess) { ok = false; return; }
+        int direct_fd = g_model_direct_fd;
+        for (;;) {
+            const size_t j = next.fetch_add(1);
+            if (j >= jobs.size() || !ok.load()) break;
+            const char *payload = NULL;
+            if (!cuda_model_stage_read_from(g_model_fd, &direct_fd, g_model_direct_align, g_model_file_size,
+                    g_stbl_reader.stage[w], g_stbl_reader.bytes, jobs[j].offset, jobs[j].bytes, &payload) ||
+                cudaMemcpyAsync(jobs[j].dst, payload, (size_t)jobs[j].bytes, cudaMemcpyHostToDevice,
+                                g_stbl_reader.stream[w]) != cudaSuccess ||
+                cudaStreamSynchronize(g_stbl_reader.stream[w]) != cudaSuccess) {
+                ok = false;
+                break;
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    const int n = (int)std::min<size_t>((size_t)threads, jobs.size());
+    for (int w = 1; w < n; w++) pool.emplace_back(work, w);
+    work(0);
+    for (auto &t : pool) t.join();
+    if (!ok) (void)cudaGetLastError();
+    return ok ? 1 : 0;
+}
+
 struct cuda_stream_upload_batch {
     uint64_t chunks = 0;
     bool active = false;
@@ -29224,8 +29316,9 @@ static int cuda_stream_selected_cache_begin_load(
          * can share a read. Apply this by default to batched prefill: small
          * single-token loads can lose decode throughput with a tight cache.
          * Keep both orders available for comparisons and failure tests. */
-        const bool ordered = getenv("DS4_CUDA_DISABLE_SSD_SORT_SELECTED_READS") == NULL &&
-            (order_reads || getenv("DS4_CUDA_SSD_SORT_SELECTED_READS") != NULL);
+        const bool ordered = stbl_read_threads() > 1 ||
+            (getenv("DS4_CUDA_DISABLE_SSD_SORT_SELECTED_READS") == NULL &&
+             (order_reads || getenv("DS4_CUDA_SSD_SORT_SELECTED_READS") != NULL));
         struct selected_copy {
             char *destination;
             uint64_t offset, bytes;
@@ -29308,6 +29401,16 @@ static int cuda_stream_selected_cache_begin_load(
                 else copies[merged++] = copy;
             }
             uint64_t complete_until[3] = {0, 0, 0};
+            if (stbl_read_threads() > 1) {
+                std::vector<stbl_copy> list;
+                for (size_t i = 0; i < merged; i++)
+                    list.push_back({copies[i].destination, copies[i].offset, copies[i].bytes});
+                if (!stbl_parallel_read(list)) {
+                    for (size_t index : pending) g_stream_expert_slots[slots[index]].used = 0;
+                    return 0;
+                }
+                merged = 0;
+            }
             for (size_t i = 0; i < merged; i++) {
                 const auto &copy = copies[i];
                 uploads.active = true;
