@@ -1,7 +1,8 @@
 """采集专家路由轨迹：用带 DS4_ROUTE_TRACE 补丁的 ds4 跑一组不同类型的提示词，每个提示词一份轨迹。
 
 不开 DSpark、温度 0、SSD 串流、专家缓存自动大小。轨迹格式见 sim/sim.py 开头。
-用法：python collect_traces.py OUT_DIR [--predict]（--predict 打开影子预测，轨迹里多出 p 行）
+用法：python collect_traces.py OUT_DIR [--predict] [--prefetch K]
+（--predict 记录下一层路由预测，轨迹里多出 p 行；--prefetch K 按预测的前 K 名在后台预取）
 """
 import json, os, subprocess, sys
 
@@ -19,13 +20,15 @@ PROMPTS = {
 }
 
 
-def main(out, predict=False):
+def main(out, predict=False, prefetch=0):
     os.makedirs(out, exist_ok=True)
     lines = []
     for name, prompt in PROMPTS.items():
         env = dict(os.environ, DS4_ROUTE_TRACE=f"{out}/{name}.trace")
         if predict:
             env["DS4_ROUTE_PREDICT"] = "1"
+        if prefetch:
+            env["DS4_ROUTE_PREFETCH"] = str(prefetch)
         cmd = [DS4, "--cuda", "-m", MODEL, "--ssd-streaming", "--ctx", "4096", "--nothink",
                "--temp", "0", "--seed", "12345", "-n", "256", "-p", prompt]
         with open(f"{out}/{name}.stdout", "w") as so, open(f"{out}/{name}.stderr", "w") as se:
@@ -38,4 +41,5 @@ def main(out, predict=False):
 
 
 if __name__ == "__main__":
-    print("\n".join(main(sys.argv[1], "--predict" in sys.argv)))
+    k = int(sys.argv[sys.argv.index("--prefetch") + 1]) if "--prefetch" in sys.argv else 0
+    print("\n".join(main(sys.argv[1], "--predict" in sys.argv, k)))
