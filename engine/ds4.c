@@ -40958,6 +40958,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(pred_logits, DS4_N_EXPERT) X(pred_probs, DS4_N_EXPERT) \
     X(pred_selected, DS4_N_EXPERT_USED) X(pred_weights, DS4_N_EXPERT_USED) \
+    X(pred2_logits, DS4_N_EXPERT) X(pred2_probs, DS4_N_EXPERT) \
+    X(pred2_selected, DS4_N_EXPERT_USED) X(pred2_weights, DS4_N_EXPERT_USED) \
     X(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP) X(mid, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(experts, DS4_N_EXPERT_USED * DS4_N_EMBD) X(routed, DS4_N_EMBD) \
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
@@ -41629,7 +41631,24 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             const ds4_gpu_stream_expert_table nt = graph_stream_expert_table_make(m, n, il + 1,
                 gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD);
             ds4_gpu_route_predict_pending(g->pred_selected, g->pred_probs,
-                (const float *)tensor_data(m, nb), &nt, il + 1, DS4_N_EXPERT_USED, DS4_N_EXPERT);
+                (const float *)tensor_data(m, nb), &nt, il + 1, DS4_N_EXPERT_USED, DS4_N_EXPERT, 1);
+        }
+    }
+    /* DS4_ROUTE_PREDICT_DEPTH=2 also guesses layer il+2 from the same input (recorded as "p2"). */
+    static int depth = -1;
+    if (depth < 0) depth = getenv("DS4_ROUTE_PREDICT_DEPTH") ? atoi(getenv("DS4_ROUTE_PREDICT_DEPTH")) : 1;
+    if (predict && depth >= 2 && g->streaming && g->tp_world == 1 && il + 2 < DS4_N_LAYER) {
+        const ds4_layer_weights *n2 = l + 2;
+        const ds4_tensor *nb2 = ds41_image_at(g, g->pos) ? n2->ffn_exp_probs_vl : n2->ffn_exp_probs_b;
+        if (nb2 && ds41_matmul(g->pred2_logits, m, n2->ffn_gate_inp, g->norm, false) &&
+            ds4_gpu_router_select_tensor(g->pred2_selected, g->pred2_weights, g->pred2_probs,
+                m->map, m->size, nb2->abs_offset, 0, 0, token,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+                g->pred2_logits)) {
+            const ds4_gpu_stream_expert_table nt2 = graph_stream_expert_table_make(m, n2, il + 2,
+                gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD);
+            ds4_gpu_route_predict_pending(g->pred2_selected, g->pred2_probs,
+                (const float *)tensor_data(m, nb2), &nt2, il + 2, DS4_N_EXPERT_USED, DS4_N_EXPERT, 2);
         }
     }
 #ifdef DS4_ROCM_BUILD

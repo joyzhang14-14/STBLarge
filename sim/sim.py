@@ -10,30 +10,31 @@ N_LAYER = 40
 
 
 def load(path):
-    """预测行「p 层号 专家…」挂到同一层接下来的那条记录上（r["pred"]）。"""
+    """预测行「p 层号 专家…」（提前一层）和「p2 层号 专家…」（提前两层）挂到同一层接下来的那条记录上（r["pred"]、r["pred2"]）。"""
     recs, pending = [], {}
     for line in open(path):
         f = line.split()
-        if f and f[0] == "p":
-            pending[int(f[1])] = [int(x) for x in f[2:]]
+        if f and f[0] in ("p", "p2"):
+            pending[(f[0], int(f[1]))] = [int(x) for x in f[2:]]
             continue
         if len(f) < 4:
             continue
         recs.append({"t": int(f[0]), "layer": int(f[1]), "slots": int(f[2]),
                      "ids": [int(x[:-1]) for x in f[3:]], "hit": [x[-1] == "h" for x in f[3:]],
-                     "pred": pending.pop(int(f[1]), None)})
+                     "pred": pending.pop(("p", int(f[1])), None),
+                     "pred2": pending.pop(("p2", int(f[1])), None)})
     return recs
 
 
-def pred_recall(steps, k=6):
+def pred_recall(steps, k=6, key="pred"):
     """预测前 k 名每层猜中的比例：|预测前 k ∩ 实际| / 实际个数。返回 {层: 比例} 和总体比例。"""
     hit, tot = collections.Counter(), collections.Counter()
     for s in steps:
         if s["kind"] == "prefill":
             continue
         for r in s["recs"]:
-            if r.get("pred") is not None:
-                hit[r["layer"]] += len(set(r["pred"][:k]) & set(r["ids"]))
+            if r.get(key) is not None:
+                hit[r["layer"]] += len(set(r[key][:k]) & set(r["ids"]))
                 tot[r["layer"]] += len(r["ids"])
     per = {L: hit[L] / tot[L] for L in sorted(tot)}
     return per, (sum(hit.values()) / sum(tot.values()) if tot else None)
@@ -250,3 +251,75 @@ def est_ms(per_step, cal, overlap):
     for miss, pf in per_step:
         tot += C + b * miss + (max(0.0, b * pf - C) if overlap else b * pf)
     return tot / len(per_step) if per_step else None
+
+
+def run_timed(steps, cap, cal, depth=1, k=6, cancel=True, oracle=False):
+    """事件模拟：后台一条读队列（先进先出），按预测预取；返回 (生成阶段每步平均 ms, 每 token 按需缺失, 每 token 预取读盘)。
+
+    第 L 层的路由一出来，就把对第 L+1 层（depth>=1，用 pred）和第 L+2 层（depth>=2，用 pred2）的前 k 名里
+    不在缓存的专家排进读队列。到了目标层：cancel=True 时只等真正要用的那几个读完，
+    还没开始读的猜错项直接丢掉；cancel=False 时等所有为这一层排的都读完。
+    按需缺失要等读队列里正在读的那一个读完，再一个个同步读。oracle=True 时用真实路由代替预测（上限）。
+    """
+    c, b = cal["layer_compute_ms"], cal["miss_ms"]
+    cache = LRU(cap)
+    t = 0.0
+    busy_until = 0.0
+    queue = []  # [目标层, 键, 开始时间, 结束时间]
+    gen_ms, misses, reads, n_gen = 0.0, 0, 0, 0
+    for s in steps:
+        gen = s["kind"] != "prefill"
+        t0 = t
+        by_layer = {r["layer"]: r for r in s["recs"]}
+        for r in s["recs"]:
+            L = r["layer"]
+            needed = {(L, e) for e in r["ids"]}
+            mine = [j for j in queue if j[0] == L]
+            if cancel:
+                started = [j for j in mine if j[2] <= t]
+                waiting = [j[3] for j in mine if j[1] in needed and j[2] <= t]
+                queued_needed = [j for j in mine if j[1] in needed and j[2] > t]
+                # 还没开始的：要用的照样读，不要的丢掉，后面的往前挪
+                keep = [j for j in queue if j[0] != L or j[2] <= t or j[1] in needed]
+                if len(keep) != len(queue):
+                    queue, cur = [], None
+                    run_end = max([j[3] for j in keep if j[2] <= t] + [t])
+                    for j in keep:
+                        if j[2] > t:
+                            j[2] = run_end
+                            j[3] = run_end + b
+                            run_end = j[3]
+                        queue.append(j)
+                    busy_until = run_end
+                    mine = [j for j in queue if j[0] == L]
+                wait_to = max([j[3] for j in mine if j[1] in needed] + [t])
+            else:
+                wait_to = max([j[3] for j in mine] + [t])
+            for j in mine:
+                if j[1] in needed or j[3] <= wait_to:
+                    cache.prefetch(j[1])
+            queue = [j for j in queue if j[0] != L]
+            t = wait_to
+            for e in r["ids"]:
+                if not cache.touch((L, e)):
+                    t = max(t, min([j[3] for j in queue if j[2] <= t] + [t])) + b
+                    misses += gen
+            busy_until = max(busy_until, t)
+            # 预测下一层、下两层
+            for d, key in ((1, "pred"), (2, "pred2")):
+                if d > depth or L + d >= N_LAYER or L + d not in by_layer:
+                    continue
+                guess = by_layer[L + d]["ids"] if oracle else (by_layer[L + d].get(key) or [])
+                for e in guess[:k]:
+                    kk = (L + d, e)
+                    if kk in cache.d or any(j[1] == kk for j in queue):
+                        continue
+                    start = max(busy_until, t)
+                    busy_until = start + b
+                    queue.append([L + d, kk, start, busy_until])
+                    reads += gen
+            t += c
+        if gen:
+            gen_ms += t - t0
+            n_gen += 1
+    return (gen_ms / n_gen if n_gen else None, misses / n_gen if n_gen else None, reads / n_gen if n_gen else None)

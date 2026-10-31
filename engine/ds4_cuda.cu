@@ -29122,26 +29122,29 @@ static void cuda_route_trace_open(void) {
 
 /* STBLarge: the graph queues a predicted expert set for the next layer; the streamed load of the
  * current layer reads it back together with the selected ids and records "p <layer> <id> ...". */
-static struct {
+struct stbl_route_predict {
     const ds4_gpu_tensor *selected, *probs;
     const float *bias;
     ds4_gpu_stream_expert_table next;
     uint32_t layer, n_used, n_expert;
     uint64_t checked, mismatched;
-} g_route_predict;
+};
+static stbl_route_predict g_route_predict, g_route_predict2;
 
 #define STBL_PREDICT_RANK 12
 
 extern "C" void ds4_gpu_route_predict_pending(const ds4_gpu_tensor *selected, const ds4_gpu_tensor *probs,
                                               const float *bias, const ds4_gpu_stream_expert_table *next,
-                                              uint32_t layer, uint32_t n_used, uint32_t n_expert) {
-    g_route_predict.next = *next;
-    g_route_predict.selected = selected;
-    g_route_predict.probs = probs;
-    g_route_predict.bias = bias;
-    g_route_predict.layer = layer;
-    g_route_predict.n_used = n_used;
-    g_route_predict.n_expert = n_expert;
+                                              uint32_t layer, uint32_t n_used, uint32_t n_expert,
+                                              uint32_t distance) {
+    auto &p = distance == 2 ? g_route_predict2 : g_route_predict;
+    p.next = *next;
+    p.selected = selected;
+    p.probs = probs;
+    p.bias = bias;
+    p.layer = layer;
+    p.n_used = n_used;
+    p.n_expert = n_expert;
 }
 
 static void cuda_route_predict_report(void) {
@@ -29152,8 +29155,8 @@ static void cuda_route_predict_report(void) {
 
 /* Read the queued prediction back and record the top STBL_PREDICT_RANK experts by
  * selection score (prob + bias, as the router ranks them) as "p <layer> <id> ...". */
-static uint32_t cuda_route_predict_take(int32_t out[STBL_PREDICT_RANK]) {
-    auto &p = g_route_predict;
+static uint32_t cuda_route_predict_take(stbl_route_predict &p, const char *tag,
+                                        int32_t out[STBL_PREDICT_RANK]) {
     const ds4_gpu_tensor *sel = p.selected;
     p.selected = NULL;
     if (!sel || !p.probs || !p.bias || p.n_used == 0 || p.n_used > STBL_PREDICT_RANK ||
@@ -29175,12 +29178,12 @@ static uint32_t cuda_route_predict_take(int32_t out[STBL_PREDICT_RANK]) {
     std::vector<int32_t> top(order, order + p.n_used), gpu(gpu_ids, gpu_ids + p.n_used);
     std::sort(top.begin(), top.end());
     std::sort(gpu.begin(), gpu.end());
-    if (p.checked++ == 0) atexit(cuda_route_predict_report);
+    if (p.checked++ == 0 && &p == &g_route_predict) atexit(cuda_route_predict_report);
     if (top != gpu) p.mismatched++;
     std::copy(order, order + k, out);
     cuda_route_trace_open();
     if (g_route_trace) {
-        fprintf(g_route_trace, "p %u", p.layer);
+        fprintf(g_route_trace, "%s %u", tag, p.layer);
         for (uint32_t i = 0; i < k; i++) fprintf(g_route_trace, " %d", order[i]);
         fputc('\n', g_route_trace);
     }
@@ -35072,11 +35075,28 @@ extern "C" int ds4_gpu_glm_store_indexer_k_tensor(
     return cuda_ok(cudaGetLastError(), "glm store indexer k launch");
 }
 
+/* STBLarge: DS4_STBL_TIMING accumulates host time spent per streamed-layer load. */
+static struct {
+    bool on;
+    double ids, take, load, prefetch;
+    uint64_t calls;
+} g_stbl_timing = {getenv("DS4_STBL_TIMING") != NULL, 0, 0, 0, 0, 0};
+
+static void stbl_timing_report(void) {
+    const auto &t = g_stbl_timing;
+    if (!t.on || !t.calls) return;
+    fprintf(stderr, "ds4: STBLarge timing: %llu loads, per load ids=%.3f ms take=%.3f ms load=%.3f ms prefetch_start=%.3f ms\n",
+            (unsigned long long)t.calls, t.ids * 1000 / t.calls, t.take * 1000 / t.calls, t.load * 1000 / t.calls,
+            t.prefetch * 1000 / t.calls);
+}
+static const int g_stbl_timing_atexit = atexit(stbl_timing_report);
+
 static int cuda_stream_selected_cache_begin_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected,
         bool                               order_reads) {
+    const double t_ids = g_stbl_timing.on ? cuda_wall_sec() : 0;
     if (!g_ssd_streaming_mode) return 1;
     if (!table || !selected || n_selected == 0 ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) {
@@ -35094,9 +35114,14 @@ static int cuda_stream_selected_cache_begin_load_tensor(
                  "GLM streaming selected-id read")) {
         return 0;
     }
+    const double t0 = g_stbl_timing.on ? cuda_wall_sec() : 0;
     int32_t predicted[STBL_PREDICT_RANK];
-    const uint32_t n_predicted = cuda_route_predict_take(predicted);
+    const uint32_t n_predicted = cuda_route_predict_take(g_route_predict, "p", predicted);
+    int32_t predicted2[STBL_PREDICT_RANK];
+    (void)cuda_route_predict_take(g_route_predict2, "p2", predicted2);
+    const double t1 = g_stbl_timing.on ? cuda_wall_sec() : 0;
     const int rc = cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected, order_reads);
+    const double t2 = g_stbl_timing.on ? cuda_wall_sec() : 0;
     static int prefetch_k = -1;
     if (prefetch_k < 0) {
         const char *v = getenv("DS4_ROUTE_PREFETCH");
@@ -35105,6 +35130,14 @@ static int cuda_stream_selected_cache_begin_load_tensor(
     if (rc && prefetch_k && n_predicted)
         (void)cuda_stream_prefetch_start(table, &g_route_predict.next, predicted,
                                          std::min<uint32_t>((uint32_t)prefetch_k, n_predicted));
+    if (g_stbl_timing.on) {
+        const double t3 = cuda_wall_sec();
+        g_stbl_timing.ids += t0 - t_ids;
+        g_stbl_timing.take += t1 - t0;
+        g_stbl_timing.load += t2 - t1;
+        g_stbl_timing.prefetch += t3 - t2;
+        g_stbl_timing.calls++;
+    }
     return rc;
 }
 
