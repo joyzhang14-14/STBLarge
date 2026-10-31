@@ -74,7 +74,7 @@ for name, p in out["prompts"].items():
     c = p["calibration"]
     print(f"  {name:14s} 实测 {p['measured_tps']} tok/s，每步 {c['step_ms']:.1f} ms，每层计算 {c['layer_compute_ms']:.2f} ms，"
           f"读一个专家 {c['miss_ms']:.2f} ms，每步缺失 {c['misses_per_step']:.1f}"
-          + (f"，影子预测猜中 {p['pred_recall'] * 100:.1f}%" if p["pred_recall"] is not None else ""))
+          + (f"，前 6 名猜中 {p['pred_recall'] * 100:.1f}%" if p["pred_recall"] is not None else ""))
 print(f"{'情况':30s} {'命中率':>7s} {'缺失/token':>9s} {'预取/token':>9s} {'串行 tok/s':>10s} {'重叠 tok/s':>10s}")
 summary = {}
 for label, g in agg.items():

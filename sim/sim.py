@@ -25,15 +25,15 @@ def load(path):
     return recs
 
 
-def pred_recall(steps):
-    """影子预测每层猜中的比例：|预测 ∩ 实际| / 实际个数。返回 {层: 比例} 和总体比例。"""
+def pred_recall(steps, k=6):
+    """预测前 k 名每层猜中的比例：|预测前 k ∩ 实际| / 实际个数。返回 {层: 比例} 和总体比例。"""
     hit, tot = collections.Counter(), collections.Counter()
     for s in steps:
         if s["kind"] == "prefill":
             continue
         for r in s["recs"]:
             if r.get("pred") is not None:
-                hit[r["layer"]] += len(set(r["pred"]) & set(r["ids"]))
+                hit[r["layer"]] += len(set(r["pred"][:k]) & set(r["ids"]))
                 tot[r["layer"]] += len(r["ids"])
     per = {L: hit[L] / tot[L] for L in sorted(tot)}
     return per, (sum(hit.values()) / sum(tot.values()) if tot else None)
