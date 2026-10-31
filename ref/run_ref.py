@@ -174,6 +174,7 @@ def main():
     ap.add_argument("--tokens", type=int, default=32)
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--thinking-mode", default="chat", choices=["chat", "thinking"])
+    ap.add_argument("--stepwise", action="store_true", help="prefill one token at a time")
     a = ap.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
@@ -204,14 +205,20 @@ def main():
     print(f"ref: {n} dense tensors loaded in {time.time() - t0:.0f}s, "
           f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB on GPU, prompt {len(ids)} tokens", flush=True)
 
-    dump_path, dumped = os.environ.get("STBL_REF_DUMP"), []
-    if dump_path:  # residual stream after every block, as [tokens, layers, hc * dim] bf16
+    dump_path, dumped, routes = os.environ.get("STBL_REF_DUMP"), [], []
+    if dump_path:  # residual stream after every block [tokens, layers, hc * dim] bf16, and routed expert ids
         for layer in model.layers:
             layer.register_forward_hook(lambda mod, inp, out: dumped.append(out[0][0].flatten(-2).to(torch.bfloat16).cpu()))
+            layer.ffn.gate.register_forward_hook(lambda mod, inp, out: routes.append(out[1].cpu()))
 
     tokens = torch.tensor([ids], dtype=torch.long)
     out_ids, logits_all = [], []
     pos, cur = 0, tokens
+    if a.stepwise:
+        for t in ids[:-1]:
+            model.forward(torch.tensor([[t]], dtype=torch.long), pos)
+            pos += 1
+        cur = tokens[:, -1:]
     for step in range(a.tokens):
         t1 = time.time()
         next_id, logits, _ = model.forward(cur, pos)
@@ -230,6 +237,8 @@ def main():
         n_layers = len(model.layers)
         calls = [torch.stack(dumped[i:i + n_layers], dim=1) for i in range(0, len(dumped), n_layers)]
         torch.save(torch.cat(calls), dump_path)
+        calls = [torch.stack(routes[i:i + n_layers], dim=1) for i in range(0, len(routes), n_layers)]
+        torch.save(torch.cat(calls), dump_path.removesuffix(".pt") + "-routes.pt")
     print("ref: text", repr(tokenizer.decode(out_ids)))
 
 

@@ -1,7 +1,8 @@
 // STBLarge DeepSeek-V4.1 decode engine: the official inference/model.py forward for one token at a
 // time, on the lossless STBLarge GGUF. Routed experts stay on SSD and are read into a GPU LRU cache;
 // Engram rows are read from the file on lookup; everything else is resident on the GPU.
-// STBL_DUMP=FILE appends the residual stream (hc x dim fp32) after every layer of every token.
+// STBL_DUMP=FILE appends the residual stream (hc x dim fp32) after every layer of every token;
+// STBL_DUMP_ROUTES=FILE appends the routed expert ids (int32, top-k order) of every layer.
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <math.h>
@@ -95,7 +96,7 @@ struct stbl_model {
     ExpertCache ec;
     std::vector<int> topk_shared;
     std::vector<char> candidates;
-    FILE *dump = nullptr;
+    FILE *dump = nullptr, *dump_routes = nullptr;
 };
 
 namespace {
@@ -238,6 +239,8 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     });
     float sum = 0.f;
     for (int i = 0; i < c.topk; i++) sum += sc[order[i]];
+    if (m->dump_routes)
+        for (int i = 0; i < c.topk; i++) fwrite(&order[i], 4, 1, m->dump_routes);
     CK(cudaMemsetAsync(m->moe_y, 0, (size_t)c.dim * 4, m->st));
     CK(cudaMemcpyAsync(m->moe_xq, x, (size_t)c.dim * 4, cudaMemcpyDeviceToDevice, m->st));
     stbl_act_quant_fp8(m->moe_xq, c.dim, m->st);
@@ -610,6 +613,8 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     CK(cudaMalloc(&m->attn_idx, (size_t)(c.window + c.index_topk + 8) * sizeof(int)));
     const char *dump = getenv("STBL_DUMP");
     if (dump && dump[0] && !(m->dump = fopen(dump, "wb"))) throw std::runtime_error("cannot open STBL_DUMP");
+    const char *routes = getenv("STBL_DUMP_ROUTES");
+    if (routes && routes[0] && !(m->dump_routes = fopen(routes, "wb"))) throw std::runtime_error("cannot open STBL_DUMP_ROUTES");
 }
 
 }  // namespace
@@ -647,6 +652,7 @@ void stbl_stats(const stbl_model *m, uint64_t *hits, uint64_t *misses) {
 
 void stbl_close(stbl_model *m) {
     if (m && m->dump) fclose(m->dump);
+    if (m && m->dump_routes) fclose(m->dump_routes);
     delete m;  // device memory is released with the process
 }
 
