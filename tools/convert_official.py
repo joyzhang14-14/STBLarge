@@ -24,12 +24,9 @@ import time
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "engine", "gguf-tools"))
-
-import glm53_quantize as G  # noqa: E402
-from deepseek41_metadata import GGUF_ALIGNMENT, metadata  # noqa: E402
-from deepseek41_quantize import scale_name, validate_scales, write_engram  # noqa: E402
+import stbl_gguf as G
+from ds41_metadata import GGUF_ALIGNMENT, metadata
+from stbl_gguf import scale_name, validate_scales, write_engram
 
 QTYPE_STBL_E4M3 = 200
 QTYPE_STBL_E8M0 = 201

@@ -17,8 +17,7 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "engine", "gguf-tools"))
-import glm53_quantize as G  # noqa: E402
+import stbl_gguf as G  # noqa: E402
 
 LAYOUT = {0: (1, 4), 30: (1, 2), 39: (32, 17), 24: (1, 1), 200: (1, 1), 201: (1, 1)}
 
