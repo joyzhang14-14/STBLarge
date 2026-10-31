@@ -5,7 +5,7 @@ kernels. Weights come straight from the official safetensors: dense ones are loa
 same conversions as the official convert.py), routed experts are read on first use and kept in an
 LRU, and Engram table rows are read from the files on lookup. Text only (vision off), no DSpark.
 
-usage: run_ref.py OUT.pt --prompt TEXT [--tokens N] [--ctx N] | --ids 1,2,3
+usage: run_ref.py OUT.pt --prompt TEXT [--system TEXT] [--tokens N] [--ctx N] | --ids 1,2,3
 Writes prompt ids, generated ids and per-step fp32 logits (greedy decoding).
 STBL_REF_EMULATE=ds4 swaps in the ds4 GGUF engine's numerics (emulate_ds4.py) for comparison.
 """
@@ -168,6 +168,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--prompt")
+    ap.add_argument("--system", default="")
     ap.add_argument("--ids")
     ap.add_argument("--tokens", type=int, default=32)
     ap.add_argument("--ctx", type=int, default=4096)
@@ -187,7 +188,8 @@ def main():
         ids = [int(x) for x in a.ids.split(",")]
     else:
         from encoding import encode_messages
-        ids = tokenizer.encode(encode_messages([{"role": "user", "content": a.prompt}], thinking_mode=a.thinking_mode))
+        messages = ([{"role": "system", "content": a.system}] if a.system else []) + [{"role": "user", "content": a.prompt}]
+        ids = tokenizer.encode(encode_messages(messages, thinking_mode=a.thinking_mode))
 
     t0 = time.time()
     ckpt = Checkpoint(CKPT)
