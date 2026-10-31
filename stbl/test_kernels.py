@@ -28,7 +28,11 @@ I = ctypes.c_int
 Fl = ctypes.c_float
 
 
+_keep = []  # tensors whose device pointers were handed out; kept alive until the kernels ran
+
+
 def ptr(t):
+    _keep.append(t)
     return P(t.data_ptr())
 
 
@@ -50,6 +54,7 @@ def check(name, got, want, tol):
 
 def sync():
     torch.cuda.synchronize()
+    _keep.clear()
 
 
 results = []
@@ -245,7 +250,7 @@ def test_engram_gate():
     got = f32(h)
     lib.stbl_engram_gate(ptr(got), ptr(f32(kv)), ptr(f32(eng.q_weight)), ptr(f32(eng.k_weight)), I(dim), I(hc),
                          Fl(1e-20), None); sync()
-    results.append(check("engram_gate", got, want.flatten(), 1e-2))
+    results.append(check("engram_gate", got.flatten(), want.flatten(), 1e-2))
 
 
 for name, fn in list(globals().items()):
