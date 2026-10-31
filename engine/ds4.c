@@ -41618,7 +41618,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     /* STBLarge (DS4_ROUTE_PREDICT): run layer il+1's router on this layer's router input.
      * The result only informs the SSD expert cache; routing of every layer is unchanged. */
     static int predict = -1;
-    if (predict < 0) predict = getenv("DS4_ROUTE_PREDICT") != NULL || getenv("DS4_ROUTE_PREFETCH") != NULL;
+    if (predict < 0) predict = getenv("DS4_ROUTE_PREDICT") != NULL || getenv("DS4_ROUTE_PREFETCH") != NULL ||
+                               getenv("DS4_STBL_PREFETCH") != NULL;
     if (predict && g->streaming && g->tp_world == 1 && il + 1 < DS4_N_LAYER) {
         const ds4_layer_weights *n = l + 1;
         const ds4_tensor *nb = ds41_image_at(g, g->pos) ? n->ffn_exp_probs_vl : n->ffn_exp_probs_b;

@@ -20,6 +20,9 @@
 #include <pthread.h>
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include "ds4_linux_memory.h"
 #include <unordered_map>
 #include <vector>
@@ -193,6 +196,7 @@ static std::vector<int32_t> g_stream_prefill_ids, g_stream_prefill_slots;
 extern "C" void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 static void cuda_stream_prefetch_before_load(const ds4_gpu_stream_expert_table *table);
 static bool cuda_stream_prefetch_protects(const cuda_stream_expert_slot &slot);
+static void stbl_pf_drain(void);
 static int cuda_stream_compact_prefill(const char **gate, const char **up,
                                       const char **down, const int32_t **ids,
                                       uint32_t *experts, uint32_t in_dim = 0,
@@ -203,6 +207,7 @@ static void cuda_stream_selected_cache_invalidate(void) {
 }
 
 static void cuda_stream_selected_cache_release(void) {
+    stbl_pf_drain();
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     const int tier = g_stream_selected_cache.logical_tier;
     if (tier >= 0 && tier < g_n_gpus) {
@@ -29165,6 +29170,12 @@ static uint32_t cuda_route_predict_take(stbl_route_predict &p, const char *tag,
         p.probs->bytes < (uint64_t)p.n_expert * sizeof(float)) return 0;
     int32_t gpu_ids[STBL_PREDICT_RANK];
     float score[1024];
+    cuda_route_trace_open();
+    if (!g_route_trace) {
+        if (!cuda_ok(cudaMemcpy(out, sel->ptr, (size_t)p.n_used * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost), "route predict ids read")) return 0;
+        return p.n_used;
+    }
     if (!cuda_ok(cudaMemcpy(gpu_ids, sel->ptr, (size_t)p.n_used * sizeof(int32_t),
                             cudaMemcpyDeviceToHost), "route predict ids read") ||
         !cuda_ok(cudaMemcpy(score, p.probs->ptr, (size_t)p.n_expert * sizeof(float),
@@ -29205,6 +29216,277 @@ static void cuda_route_trace(const ds4_gpu_stream_expert_table *table,
     fputc('\n', g_route_trace);
 }
 
+/* ---- STBLarge predicted prefetch (DS4_STBL_PREFETCH=K) -------------------------------------
+ * After a layer's routed experts are loaded, the experts predicted for the next layer(s) that are
+ * not cached are queued for a small pool of resident reader threads. The main thread owns all cache
+ * metadata: it reserves an LRU slot per job (used = UINT64_MAX, the same convention ds4's look-ahead
+ * uses, so demand loads never evict it); readers only copy bytes into that slot. When the target
+ * layer arrives, needed jobs that finished become hits, a needed job being read is waited for, a
+ * needed job not yet started is cancelled and read by the demand path, unneeded jobs not yet
+ * started are cancelled, and unneeded finished jobs stay as low-priority cache entries.
+ * Routing is never changed, so output is identical with or without prefetch. */
+enum { STBL_FREE = 0, STBL_QUEUED, STBL_RUNNING, STBL_DONE, STBL_CANCELLED, STBL_FAILED };
+
+struct stbl_job {
+    std::atomic<int> state{STBL_FREE};
+    std::atomic<bool> popped{true};
+    uint32_t layer = 0, slot = 0;
+    uint64_t gate = 0, up = 0, down = 0, gate_bytes = 0, down_bytes = 0, seq = 0;
+    bool settled = true;
+};
+
+static struct {
+    std::vector<std::thread> threads;
+    std::mutex mu;
+    std::condition_variable cv, done_cv;
+    std::deque<stbl_job *> queue;
+    stbl_job jobs[256];
+    bool stop = false, started = false;
+    int device = 0;
+    uint64_t seq = 0;
+    uint64_t issued = 0, hit = 0, waited = 0, stolen = 0, unused = 0, cancelled = 0;
+    double wait_sec = 0;
+} g_stbl_pf;
+
+static int stbl_prefetch_k(void) {
+    static int k = -1;
+    if (k < 0) {
+        const char *v = getenv("DS4_STBL_PREFETCH");
+        k = v ? std::max(0, std::min(atoi(v), STBL_PREDICT_RANK)) : 0;
+    }
+    return k;
+}
+
+static void stbl_pf_worker(int w) {
+    (void)w;
+    auto &pf = g_stbl_pf;
+    if (cudaSetDevice(pf.device) != cudaSuccess) return;
+    const uint64_t piece = UINT64_C(8) << 20;
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    void *raw = NULL;
+    cudaStream_t stream = NULL;
+    if (cudaMallocHost(&raw, piece + 2 * align) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    char *stage = (char *)cuda_align_ptr(raw, align);
+    int direct_fd = g_model_direct_fd;
+    for (;;) {
+        stbl_job *j;
+        {
+            std::unique_lock<std::mutex> lk(pf.mu);
+            pf.cv.wait(lk, [&] { return pf.stop || !pf.queue.empty(); });
+            if (pf.queue.empty()) break;
+            j = pf.queue.front();
+            pf.queue.pop_front();
+        }
+        int expect = STBL_QUEUED;
+        if (!j->state.compare_exchange_strong(expect, STBL_RUNNING)) {
+            j->popped.store(true);
+            continue;
+        }
+        auto &cache = g_stream_selected_cache;
+        char *dst[3] = {cache.gate_ptr + (uint64_t)j->slot * j->gate_bytes,
+                        cache.up_ptr + (uint64_t)j->slot * j->gate_bytes,
+                        cache.down_ptr + (uint64_t)j->slot * j->down_bytes};
+        const uint64_t off[3] = {j->gate, j->up, j->down};
+        const uint64_t len[3] = {j->gate_bytes, j->gate_bytes, j->down_bytes};
+        bool ok = true;
+        for (int part = 0; ok && part < 3; part++) {
+            for (uint64_t at = 0; ok && at < len[part]; at += piece) {
+                const uint64_t n = std::min(piece, len[part] - at);
+                const char *payload = NULL;
+                ok = cuda_model_stage_read_from(g_model_fd, &direct_fd, g_model_direct_align, g_model_file_size,
+                         stage, piece + align, off[part] + at, n, &payload) &&
+                     cudaMemcpyAsync(dst[part] + at, payload, (size_t)n, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                     cudaStreamSynchronize(stream) == cudaSuccess;
+            }
+        }
+        if (!ok) (void)cudaGetLastError();
+        {
+            std::lock_guard<std::mutex> lk(pf.mu);
+            j->state.store(ok ? STBL_DONE : STBL_FAILED);
+            j->popped.store(true);
+        }
+        pf.done_cv.notify_all();
+    }
+    (void)cudaStreamDestroy(stream);
+    (void)cudaFreeHost(raw);
+}
+
+static void stbl_pf_shutdown(void) {
+    auto &pf = g_stbl_pf;
+    {
+        std::lock_guard<std::mutex> lk(pf.mu);
+        pf.stop = true;
+        for (auto *j : pf.queue) {
+            int expect = STBL_QUEUED;
+            j->state.compare_exchange_strong(expect, STBL_CANCELLED);
+        }
+    }
+    pf.cv.notify_all();
+    for (auto &t : pf.threads) if (t.joinable()) t.join();
+    pf.threads.clear();
+    if (pf.issued)
+        fprintf(stderr, "ds4: STBLarge prefetch: issued %llu, hit %llu (waited %llu, %.3f ms avg), "
+                "read by demand %llu, unused %llu, cancelled %llu\n",
+                (unsigned long long)pf.issued, (unsigned long long)pf.hit, (unsigned long long)pf.waited,
+                pf.waited ? pf.wait_sec * 1000 / pf.waited : 0.0, (unsigned long long)pf.stolen,
+                (unsigned long long)pf.unused, (unsigned long long)pf.cancelled);
+}
+
+static bool stbl_pf_start(void) {
+    auto &pf = g_stbl_pf;
+    if (pf.started) return !pf.threads.empty();
+    pf.started = true;
+    if (cudaGetDevice(&pf.device) != cudaSuccess) return false;
+    const char *v = getenv("DS4_STBL_PREFETCH_THREADS");
+    const int n = v ? std::max(1, std::min(atoi(v), 8)) : 3;
+    try {
+        for (int i = 0; i < n; i++) pf.threads.emplace_back(stbl_pf_worker, i);
+    } catch (...) {
+        return false;
+    }
+    atexit(stbl_pf_shutdown);
+    return true;
+}
+
+/* Release a reserved slot without publishing it. */
+static void stbl_pf_unreserve(stbl_job &j) {
+    if (j.slot < g_stream_expert_slots.size() && g_stream_expert_slots[j.slot].used == UINT64_MAX)
+        g_stream_expert_slots[j.slot].used = 0;
+}
+
+/* Publish a finished read as a low-priority cache entry; a hit promotes it. */
+static void stbl_pf_publish(stbl_job &j) {
+    if (j.slot >= g_stream_expert_slots.size()) return;
+    auto &slot = g_stream_expert_slots[j.slot];
+    if (slot.used != UINT64_MAX || slot.gate != j.gate) return;
+    if (g_stream_expert_by_gate.count(j.gate)) { slot.used = 0; return; }
+    try {
+        g_stream_expert_by_gate[j.gate] = j.slot;
+        slot.used = 1;
+    } catch (...) {
+        slot.used = 0;
+    }
+}
+
+static void stbl_pf_wait(stbl_job &j) {
+    auto &pf = g_stbl_pf;
+    const double t0 = cuda_wall_sec();
+    std::unique_lock<std::mutex> lk(pf.mu);
+    pf.done_cv.wait(lk, [&] { const int s = j.state.load(); return s == STBL_DONE || s == STBL_FAILED; });
+    pf.wait_sec += cuda_wall_sec() - t0;
+    pf.waited++;
+}
+
+/* Called by the main thread at the start of a layer's streamed load, before cache lookups. */
+static void stbl_pf_settle(const ds4_gpu_stream_expert_table *table, const int32_t *ids, uint32_t n) {
+    auto &pf = g_stbl_pf;
+    if (!pf.started) return;
+    pf.seq++;
+    for (auto &j : pf.jobs) {
+        if (j.settled) {
+            if (j.state.load() != STBL_FREE && j.popped.load()) j.state.store(STBL_FREE);
+            continue;
+        }
+        const bool target = j.layer == table->layer && j.gate >= table->gate_offset &&
+            j.gate < table->gate_offset + (uint64_t)table->n_total_expert * table->gate_expert_bytes;
+        const bool stale = j.seq + 4 < pf.seq;
+        if (!target && !stale) continue;
+        bool need = false;
+        if (target) {
+            const uint64_t expert = (j.gate - table->gate_offset) / table->gate_expert_bytes;
+            for (uint32_t i = 0; i < n && !need; i++) need = (uint64_t)ids[i] == expert;
+        }
+        int expect = STBL_QUEUED;
+        if (j.state.compare_exchange_strong(expect, STBL_CANCELLED)) {
+            stbl_pf_unreserve(j);
+            j.settled = true;
+            if (need) pf.stolen++; else pf.cancelled++;
+            continue;
+        }
+        if (j.state.load() == STBL_RUNNING) {
+            if (!need) continue; /* finish in the background; settled later as stale */
+            stbl_pf_wait(j);
+        }
+        if (j.state.load() == STBL_DONE) {
+            stbl_pf_publish(j);
+            if (need) pf.hit++; else pf.unused++;
+        } else {
+            stbl_pf_unreserve(j);
+        }
+        j.settled = true;
+    }
+}
+
+/* Drop every outstanding job (cache reset or release): cancel queued ones, wait for running ones. */
+static void stbl_pf_drain(void) {
+    auto &pf = g_stbl_pf;
+    if (!pf.started) return;
+    for (auto &j : pf.jobs) {
+        if (j.settled) continue;
+        int expect = STBL_QUEUED;
+        if (!j.state.compare_exchange_strong(expect, STBL_CANCELLED) && j.state.load() == STBL_RUNNING)
+            stbl_pf_wait(j);
+        stbl_pf_unreserve(j);
+        j.settled = true;
+    }
+}
+
+/* Queue up to n predicted experts of the layer described by next. */
+static void stbl_pf_issue(const ds4_gpu_stream_expert_table *next, const int32_t *ids, uint32_t n) {
+    auto &pf = g_stbl_pf;
+    auto &cache = g_stream_selected_cache;
+    if (!next || !n || !cache.gate_ptr || next->model_map != cache.model_map ||
+        next->gate_expert_bytes != cache.gate_expert_bytes || next->down_expert_bytes != cache.down_expert_bytes ||
+        g_model_fd < 0 || !stbl_pf_start())
+        return;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= next->n_total_expert) continue;
+        const uint64_t e = (uint32_t)ids[i];
+        const uint64_t gate = next->gate_offset + e * next->gate_expert_bytes;
+        if (g_stream_expert_by_gate.count(gate)) continue;
+        bool queued = false;
+        stbl_job *free_job = NULL;
+        for (auto &j : pf.jobs) {
+            if (!j.settled && j.gate == gate) { queued = true; break; }
+            if (!free_job && j.settled && j.state.load() == STBL_FREE) free_job = &j;
+        }
+        if (queued || !free_job) continue;
+        uint32_t victim = UINT32_MAX;
+        uint64_t oldest = UINT64_MAX;
+        for (uint32_t s = 0; s < g_stream_expert_slots.size(); s++) {
+            const uint64_t used = g_stream_expert_slots[s].used;
+            if (used < oldest) { oldest = used; victim = s; if (!used) break; }
+        }
+        if (victim == UINT32_MAX || oldest == UINT64_MAX) return;
+        auto &slot = g_stream_expert_slots[victim];
+        if (slot.used) g_stream_expert_by_gate.erase(slot.gate);
+        slot = {gate, next->up_offset + e * next->gate_expert_bytes,
+                next->down_offset + e * next->down_expert_bytes, UINT64_MAX};
+        stbl_job &j = *free_job;
+        j.layer = next->layer;
+        j.slot = victim;
+        j.gate = slot.gate;
+        j.up = slot.up;
+        j.down = slot.down;
+        j.gate_bytes = next->gate_expert_bytes;
+        j.down_bytes = next->down_expert_bytes;
+        j.seq = pf.seq;
+        j.settled = false;
+        j.popped.store(false);
+        j.state.store(STBL_QUEUED);
+        {
+            std::lock_guard<std::mutex> lk(pf.mu);
+            pf.queue.push_back(&j);
+        }
+        pf.cv.notify_one();
+        pf.issued++;
+    }
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -29221,6 +29503,7 @@ static int cuda_stream_selected_cache_begin_load(
     }
     if (!cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "stream expert reuse wait"))
         return 0;
+    stbl_pf_settle(table, selected_ids, slot_count);
     try {
         std::vector<int32_t> expert_to_slot(table->n_total_expert, -1);
         std::vector<int32_t> unique, remap(slot_count);
@@ -29290,6 +29573,7 @@ static int cuda_stream_selected_cache_begin_load(
         }
         if (!cuda_stream_selected_ensure_i32(slot_count)) return 0;
         if (!g_stream_expert_budget || g_stream_expert_clock == UINT64_MAX) {
+            stbl_pf_drain();
             ds4_gpu_stream_expert_cache_prefetch_finish(true);
             g_stream_expert_by_gate.clear();
             for (auto &slot : g_stream_expert_slots) slot.used = 0;
@@ -35118,7 +35402,9 @@ static int cuda_stream_selected_cache_begin_load_tensor(
     int32_t predicted[STBL_PREDICT_RANK];
     const uint32_t n_predicted = cuda_route_predict_take(g_route_predict, "p", predicted);
     int32_t predicted2[STBL_PREDICT_RANK];
-    (void)cuda_route_predict_take(g_route_predict2, "p2", predicted2);
+    const ds4_gpu_stream_expert_table next2 = g_route_predict2.next;
+    const bool has_next2 = g_route_predict2.selected != NULL;
+    const uint32_t n_predicted2 = cuda_route_predict_take(g_route_predict2, "p2", predicted2);
     const double t1 = g_stbl_timing.on ? cuda_wall_sec() : 0;
     const int rc = cuda_stream_selected_cache_begin_load(table, ids.data(), n_selected, order_reads);
     const double t2 = g_stbl_timing.on ? cuda_wall_sec() : 0;
@@ -35130,6 +35416,11 @@ static int cuda_stream_selected_cache_begin_load_tensor(
     if (rc && prefetch_k && n_predicted)
         (void)cuda_stream_prefetch_start(table, &g_route_predict.next, predicted,
                                          std::min<uint32_t>((uint32_t)prefetch_k, n_predicted));
+    const uint32_t stbl_k = (uint32_t)stbl_prefetch_k();
+    if (rc && stbl_k) {
+        if (n_predicted) stbl_pf_issue(&g_route_predict.next, predicted, std::min(stbl_k, n_predicted));
+        if (has_next2 && n_predicted2) stbl_pf_issue(&next2, predicted2, std::min(stbl_k, n_predicted2));
+    }
     if (g_stbl_timing.on) {
         const double t3 = cuda_wall_sec();
         g_stbl_timing.ids += t0 - t_ids;
