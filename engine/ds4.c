@@ -23320,6 +23320,25 @@ static bool metal_graph_decode_selected_readahead_override(
     return true;
 }
 
+/* STBLarge shadow predictor (DS4_ROUTE_PREDICT): at layer il, run layer il+1's router on the
+ * router input of layer il and record the top-k it would pick. Logging only; routing is unchanged. */
+static void stbl_shadow_predict(ds4_gpu_graph *g, const ds4_model *model,
+                                const ds4_layer_weights *layer, uint32_t il) {
+    if (il + 1 >= DS4_N_LAYER) return;
+    const ds4_layer_weights *next = layer + 1;
+    if (next->ffn_gate_tid2eid || !next->ffn_gate_inp) return;
+    if (ds4_gpu_tensor_read(metal_graph_ffn_norm(g), 0, g->cpu_router_norm,
+                            (uint64_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0])) == 0) return;
+    float logits[DS4_MAX_EXPERT], probs[DS4_MAX_EXPERT], weights[DS4_MAX_EXPERT_USED];
+    int selected[DS4_MAX_EXPERT_USED];
+    int32_t ids[DS4_MAX_EXPERT_USED];
+    matvec_any(logits, model, next->ffn_gate_inp, g->cpu_router_norm);
+    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) probs[i] = sqrtf(softplus_stable(logits[i]));
+    layer_topk_selected_experts_from_probs(selected, weights, model, next, probs);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) ids[i] = (int32_t)selected[i];
+    ds4_gpu_route_trace_predict(il + 1, ids, DS4_N_EXPERT_USED);
+}
+
 static bool metal_graph_decode_cuda_selected_load(
         ds4_gpu_graph            *g,
         const ds4_model          *model,
@@ -23352,6 +23371,7 @@ static bool metal_graph_decode_cuda_selected_load(
                                   (uint64_t)DS4_N_EXPERT_USED *
                                       sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
+    if (ok && getenv("DS4_ROUTE_PREDICT")) stbl_shadow_predict(g, model, layer, il);
 
     if (ok) {
         const ds4_gpu_stream_expert_table table =

@@ -29017,19 +29017,31 @@ struct cuda_stream_upload_batch {
 static FILE *g_route_trace;
 static bool g_route_trace_ready;
 
+static void cuda_route_trace_open(void) {
+    if (g_route_trace_ready) return;
+    g_route_trace_ready = true;
+    const char *path = getenv("DS4_ROUTE_TRACE");
+    if (path && path[0]) {
+        g_route_trace = fopen(path, "w");
+        if (!g_route_trace) fprintf(stderr, "ds4: cannot open DS4_ROUTE_TRACE %s\n", path);
+        else setvbuf(g_route_trace, NULL, _IOFBF, 1 << 20);
+    }
+}
+
+/* STBLarge: a predicted expert set for an upcoming layer, written as "p <layer> <id> ...". */
+extern "C" void ds4_gpu_route_trace_predict(uint32_t layer, const int32_t *ids, uint32_t n) {
+    cuda_route_trace_open();
+    if (!g_route_trace) return;
+    fprintf(g_route_trace, "p %u", layer);
+    for (uint32_t i = 0; i < n; i++) fprintf(g_route_trace, " %d", ids[i]);
+    fputc('\n', g_route_trace);
+}
+
 static void cuda_route_trace(const ds4_gpu_stream_expert_table *table,
                              uint32_t slot_count,
                              const std::vector<int32_t> &unique,
                              const std::vector<int32_t> &slots) {
-    if (!g_route_trace_ready) {
-        g_route_trace_ready = true;
-        const char *path = getenv("DS4_ROUTE_TRACE");
-        if (path && path[0]) {
-            g_route_trace = fopen(path, "w");
-            if (!g_route_trace) fprintf(stderr, "ds4: cannot open DS4_ROUTE_TRACE %s\n", path);
-            else setvbuf(g_route_trace, NULL, _IOFBF, 1 << 20);
-        }
-    }
+    cuda_route_trace_open();
     if (!g_route_trace) return;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
