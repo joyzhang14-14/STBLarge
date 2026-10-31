@@ -7,6 +7,7 @@ LRU, and Engram table rows are read from the files on lookup. Text only (vision 
 
 usage: run_ref.py OUT.pt --prompt TEXT [--tokens N] [--ctx N] | --ids 1,2,3
 Writes prompt ids, generated ids and per-step fp32 logits (greedy decoding).
+STBL_REF_EMULATE=ds4 swaps in the ds4 GGUF engine's numerics (emulate_ds4.py) for comparison.
 """
 
 import argparse
@@ -192,6 +193,10 @@ def main():
     ckpt = Checkpoint(CKPT)
     model = build(args, tokenizer, ckpt)
     n = load_dense(model, ckpt)
+    if os.environ.get("STBL_REF_EMULATE") == "ds4":
+        import emulate_ds4
+        emulate_ds4.apply(model)
+        print("ref: emulating the ds4 GGUF numerics", flush=True)
     torch.set_default_device("cuda")
     print(f"ref: {n} dense tensors loaded in {time.time() - t0:.0f}s, "
           f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB on GPU, prompt {len(ids)} tokens", flush=True)
