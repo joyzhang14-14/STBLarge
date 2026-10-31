@@ -29224,6 +29224,8 @@ static void cuda_route_trace(const ds4_gpu_stream_expert_table *table,
  * layer arrives, needed jobs that finished become hits, a needed job being read is waited for, a
  * needed job not yet started is cancelled and read by the demand path, unneeded jobs not yet
  * started are cancelled, and unneeded finished jobs stay as low-priority cache entries.
+ * DS4_STBL_PREFETCH=K prefetches the top K predictions for the next layer; with
+ * DS4_ROUTE_PREDICT_DEPTH=2, DS4_STBL_PREFETCH2=K2 (default K) does the same two layers ahead.
  * Routing is never changed, so output is identical with or without prefetch. */
 enum { STBL_FREE = 0, STBL_QUEUED, STBL_RUNNING, STBL_DONE, STBL_CANCELLED, STBL_FAILED };
 
@@ -35419,7 +35421,13 @@ static int cuda_stream_selected_cache_begin_load_tensor(
     const uint32_t stbl_k = (uint32_t)stbl_prefetch_k();
     if (rc && stbl_k) {
         if (n_predicted) stbl_pf_issue(&g_route_predict.next, predicted, std::min(stbl_k, n_predicted));
-        if (has_next2 && n_predicted2) stbl_pf_issue(&next2, predicted2, std::min(stbl_k, n_predicted2));
+        static int k2 = -1;
+        if (k2 < 0) {
+            const char *v = getenv("DS4_STBL_PREFETCH2");
+            k2 = v ? std::max(0, std::min(atoi(v), STBL_PREDICT_RANK)) : (int)stbl_k;
+        }
+        if (has_next2 && n_predicted2 && k2)
+            stbl_pf_issue(&next2, predicted2, std::min((uint32_t)k2, n_predicted2));
     }
     if (g_stbl_timing.on) {
         const double t3 = cuda_wall_sec();
