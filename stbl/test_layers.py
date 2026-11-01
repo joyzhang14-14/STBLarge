@@ -87,7 +87,7 @@ def main():
     if stages:
         passes = [(il, s) for il in layers for s in stages]
     for il, stage in passes:
-        errs, flips = [], []
+        errs, flips, stats = [], [], []
         for pos, r in enumerate(rec[il]):
             h = {2: r["h_block"], 3: r["attn_in"], 4: r["ffn_in"]}.get(stage, r["h"]).flatten().contiguous()
             pre = r["pre"].contiguous()
@@ -103,13 +103,22 @@ def main():
                     flips.append((pos, round(r["margin"], 4), sorted(set(route[:k]) ^ set(r["route"]))))
             e = float((got - want).abs().max() / want.abs().max())
             ep = float((pre_out - r["pre_out"]).abs().max())
+            # bf16 ulp of each reference element: errors of at most one ulp are rounding flips
+            ulp = torch.ldexp(torch.ones_like(want), torch.frexp(want)[1] - 8).clamp_min(2.0 ** -133)
+            big = int(((got - want).abs() > 1.01 * ulp).sum())
+            l2 = float((got - want).norm() / want.norm().clamp_min(1e-30))
             errs.append((e, ep, pos))
+            stats.append((l2, big))
         es = torch.tensor([x[0] for x in errs])
         worst = sorted(errs, reverse=True)[:6]
         if stage == 4:
             print(f"layer {il} route mismatches {len(flips)}/{len(errs)} (pos, ref margin, differing ids): {flips}", flush=True)
         print(f"layer {il} {['engram+block', 'engram only', 'block only', 'attention only', 'moe only'][stage]}: rel err median {es.median():.1e} max {es.max():.1e}; worst (err, pre_mix err, pos): "
               + "  ".join(f"({e:.1e},{p:.0e},{q})" for e, p, q in worst), flush=True)
+        l2s = torch.tensor([x[0] for x in stats])
+        bigs = [x[1] for x in stats]
+        print(f"    L2 rel median {l2s.median():.1e} max {l2s.max():.1e}; elements off by >1 ulp: median {sorted(bigs)[len(bigs) // 2]} "
+              f"max {max(bigs)} of {want.numel()} (worst pos {max(range(len(bigs)), key=bigs.__getitem__)})", flush=True)
 
 
 if __name__ == "__main__":
