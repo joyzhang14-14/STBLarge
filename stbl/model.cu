@@ -3,6 +3,7 @@
 // Engram rows are read from the file on lookup; everything else is resident on the GPU.
 // STBL_DUMP=FILE appends the residual stream (hc x dim fp32) after every layer of every token;
 // STBL_DUMP_ROUTES=FILE appends the routed expert ids (int32, top-k order) of every layer.
+// STBL_READ_THREADS=N (default 4) reads the missing experts of a layer in 2 MiB pieces with N threads.
 // STBL_TIMING=1 syncs the stream at every section boundary and adds the wall time to per-section
 // totals (stbl_timing); it slows decoding down, so it is for measurement runs only.
 #include <cuda_runtime.h>
@@ -14,11 +15,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <list>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -68,7 +71,7 @@ enum TimeCat { T_HC, T_ENGRAM, T_ATTN, T_ROUTER, T_READ, T_EXPERT, T_SHARED, T_H
 struct ExpertCache {
     int slots = 0;
     uint64_t slot_bytes = 0;
-    uint8_t *mem = nullptr, *stage = nullptr;
+    uint8_t *mem = nullptr;
     std::unordered_map<uint64_t, std::pair<int, std::list<uint64_t>::iterator>> where;
     std::list<uint64_t> lru;
     uint64_t hits = 0, misses = 0;
@@ -99,6 +102,10 @@ struct stbl_model {
     float *router, *moe_xq, *moe_g, *moe_u, *moe_mid, *moe_out, *moe_y, *eng_vals, *eng_kv, *logits;
     int *attn_idx;
     ExpertCache ec;
+    // expert readers: one pinned stage and copy stream each; dfd is the O_DIRECT descriptor (-1: buffered)
+    int dfd = -1;
+    std::vector<uint8_t *> rstage;
+    std::vector<cudaStream_t> rstream;
     std::vector<int> topk_shared, last_route;
     std::vector<char> candidates;
     FILE *dump = nullptr, *dump_routes = nullptr;
@@ -207,7 +214,50 @@ std::vector<float> to_host(stbl_model *m, const float *d, int n) {
 
 // ---- experts ------------------------------------------------------------------------------------
 
-const uint8_t *expert(stbl_model *m, int layer, int e) {
+constexpr uint64_t kPiece = 2 << 20, kAlign = 4096;
+
+struct Piece {
+    uint8_t *dst;
+    uint64_t off, bytes;
+};
+
+// Reads `bytes` at file offset `off` into `stage` (kPiece + 2 * kAlign bytes); returns where the data starts.
+const uint8_t *read_range(stbl_model *m, uint8_t *stage, uint64_t off, uint64_t bytes) {
+    const int fd = m->dfd >= 0 ? m->dfd : m->f.fd;
+    const uint64_t start = m->dfd >= 0 ? off & ~(kAlign - 1) : off, need = off - start + bytes;
+    const uint64_t len = m->dfd >= 0 ? (need + kAlign - 1) & ~(kAlign - 1) : need;
+    uint64_t got = 0;
+    while (got < need) {
+        const ssize_t n = pread(fd, stage + got, len - got, (off_t)(start + got));
+        if (n <= 0) return nullptr;  // n == 0: end of file (an O_DIRECT read may run past it)
+        got += (uint64_t)n;
+    }
+    return stage + (off - start);
+}
+
+// Reads the pieces into device memory with all reader threads; returns once every copy has landed.
+void read_pieces(stbl_model *m, const std::vector<Piece> &ps) {
+    std::atomic<size_t> next{0};
+    std::atomic<bool> ok{true};
+    auto work = [&](int w) {
+        for (size_t j; ok && (j = next++) < ps.size();) {
+            const uint8_t *src = read_range(m, m->rstage[w], ps[j].off, ps[j].bytes);
+            if (!src || cudaMemcpyAsync(ps[j].dst, src, ps[j].bytes, cudaMemcpyHostToDevice, m->rstream[w]) != cudaSuccess ||
+                cudaStreamSynchronize(m->rstream[w]) != cudaSuccess)
+                ok = false;
+        }
+    };
+    std::vector<std::thread> pool;
+    const int n = (int)std::min(m->rstage.size(), ps.size());
+    for (int w = 1; w < n; w++) pool.emplace_back(work, w);
+    work(0);
+    for (auto &t : pool) t.join();
+    if (!ok) throw std::runtime_error("expert read failed");
+}
+
+// Cache slot of expert e of a layer. A miss takes a free or the least recently used slot and appends
+// the expert's bytes to `ps`; the caller reads them before the slot is used.
+const uint8_t *expert(stbl_model *m, int layer, int e, std::vector<Piece> &ps) {
     ExpertCache &ec = m->ec;
     const uint64_t key = (uint64_t)layer << 32 | (uint32_t)e;
     auto it = ec.where.find(key);
@@ -227,16 +277,12 @@ const uint8_t *expert(stbl_model *m, int layer, int e) {
         ec.lru.pop_back();
     }
     const Layer &l = m->L[layer];
-    CK(cudaStreamSynchronize(m->st));  // the stage buffer may still feed an earlier copy
-    uint64_t off = 0;
-    for (int p = 0; p < 3; p++) {
-        const uint64_t file_off = (uint64_t)(l.exp_w[p] - m->f.map) + (uint64_t)e * l.exp_bytes[p];
-        if (pread(m->f.fd, ec.stage + off, l.exp_bytes[p], (off_t)file_off) != (ssize_t)l.exp_bytes[p])
-            throw std::runtime_error("expert read failed");
-        off += l.exp_bytes[p];
-    }
     uint8_t *dst = ec.mem + (uint64_t)slot * ec.slot_bytes;
-    CK(cudaMemcpyAsync(dst, ec.stage, ec.slot_bytes, cudaMemcpyHostToDevice, m->st));
+    for (uint64_t p = 0, at = 0; p < 3; at += l.exp_bytes[p++]) {
+        const uint64_t file_off = (uint64_t)(l.exp_w[p] - m->f.map) + (uint64_t)e * l.exp_bytes[p];
+        for (uint64_t i = 0; i < l.exp_bytes[p]; i += kPiece)
+            ps.push_back({dst + at + i, file_off + i, std::min(kPiece, l.exp_bytes[p] - i)});
+    }
     ec.lru.push_front(key);
     ec.where[key] = {slot, ec.lru.begin()};
     return dst;
@@ -263,6 +309,18 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     m->last_route.assign(order.begin(), order.begin() + c.topk);
     if (m->dump_routes)
         for (int i = 0; i < c.topk; i++) fwrite(&order[i], 4, 1, m->dump_routes);
+    // m->st is idle here (to_host synced it), so evicted slots are no longer read by earlier kernels.
+    // Cached experts of this layer are touched first so that a miss cannot evict one of them.
+    mark(m, T_READ);
+    for (int i = 0; i < c.topk; i++) {
+        auto it = m->ec.where.find((uint64_t)il << 32 | (uint32_t)order[i]);
+        if (it != m->ec.where.end()) m->ec.lru.splice(m->ec.lru.begin(), m->ec.lru, it->second.second);
+    }
+    std::vector<Piece> ps;
+    std::vector<const uint8_t *> ew(c.topk);
+    for (int i = 0; i < c.topk; i++) ew[i] = expert(m, il, order[i], ps);
+    read_pieces(m, ps);
+    mark(m, T_ROUTER);
     CK(cudaMemsetAsync(m->moe_y, 0, (size_t)c.dim * 4, m->st));
     CK(cudaMemcpyAsync(m->moe_xq, x, (size_t)c.dim * 4, cudaMemcpyDeviceToDevice, m->st));
     stbl_act_quant_fp8(m->moe_xq, c.dim, m->st);
@@ -272,14 +330,12 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
         float w = sc[e];
         w /= sum + 1e-20f;
         w *= c.route_scale;
-        mark(m, T_READ);
-        const uint8_t *ew = expert(m, il, e);
-        mark(m, T_EXPERT);
-        stbl_gemv_mxfp4(m->moe_g, ew, m->moe_xq, c.inter, c.dim, m->st);
-        stbl_gemv_mxfp4(m->moe_u, ew + up, m->moe_xq, c.inter, c.dim, m->st);
+        if (i == 0) mark(m, T_EXPERT);
+        stbl_gemv_mxfp4(m->moe_g, ew[i], m->moe_xq, c.inter, c.dim, m->st);
+        stbl_gemv_mxfp4(m->moe_u, ew[i] + up, m->moe_xq, c.inter, c.dim, m->st);
         stbl_swiglu(m->moe_mid, m->moe_g, m->moe_u, w, c.swiglu_limit, c.inter, m->st);
         stbl_act_quant_fp8(m->moe_mid, c.inter, m->st);
-        stbl_gemv_mxfp4(m->moe_out, ew + down, m->moe_mid, c.dim, c.inter, m->st);
+        stbl_gemv_mxfp4(m->moe_out, ew[i] + down, m->moe_mid, c.dim, c.inter, m->st);
         stbl_axpy(m->moe_y, m->moe_out, 1.f, c.dim, m->st);
     }
     mark(m, T_SHARED);
@@ -625,7 +681,16 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->ec.slots = slots;
     m->ec.slot_bytes = expert_bytes;
     CK(cudaMalloc(&m->ec.mem, (size_t)slots * expert_bytes));
-    CK(cudaMallocHost(&m->ec.stage, expert_bytes));
+    const char *rt = getenv("STBL_READ_THREADS");
+    const int readers = std::max(1, std::min(rt && rt[0] ? atoi(rt) : 4, 16));
+    m->rstage.resize(readers);
+    m->rstream.resize(readers);
+    for (int w = 0; w < readers; w++) {
+        CK(cudaMallocHost(&m->rstage[w], kPiece + 2 * kAlign));
+        if ((uintptr_t)m->rstage[w] % kAlign) throw std::runtime_error("reader stage is not page aligned");  // O_DIRECT needs it
+        CK(cudaStreamCreateWithFlags(&m->rstream[w], cudaStreamNonBlocking));
+    }
+    m->dfd = open(path, O_RDONLY | O_DIRECT);  // -1 (buffered reads) where the file system refuses it
     CK(cudaMallocHost(&m->eng_stage, 64 * 264));
 
     const size_t n = (size_t)c.hc * c.dim, qd = (size_t)c.heads * c.head_dim;
@@ -732,6 +797,7 @@ void stbl_stats(const stbl_model *m, uint64_t *hits, uint64_t *misses) {
 void stbl_close(stbl_model *m) {
     if (m && m->dump) fclose(m->dump);
     if (m && m->dump_routes) fclose(m->dump_routes);
+    if (m && m->dfd >= 0) close(m->dfd);
     delete m;  // device memory is released with the process
 }
 
