@@ -20,8 +20,9 @@ void stbl_stats(const stbl_model *m, uint64_t *expert_hits, uint64_t *expert_mis
 // Test hook: run Engram (if layer il has one) and block il alone at position pos, on the given residual
 // stream h_in (hc*dim fp32) and incoming pre_mix (hc); writes h_out and the outgoing pre_mix. Only that
 // layer's caches advance, so call it for positions 0, 1, 2, ... of one sequence. Returns 0, or -1.
+// stage 0: Engram + block, 1: Engram only (h_out = stream after Engram), 2: block only.
 int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in, const float *pre_in,
-                    float *h_out, float *pre_out);
+                    float *h_out, float *pre_out, int stage);
 void stbl_close(stbl_model *m);
 
 #ifdef __cplusplus

@@ -643,7 +643,7 @@ int stbl_step(stbl_model *m, int token, float *logits) {
 }
 
 int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in, const float *pre_in,
-                    float *h_out, float *pre_out) {
+                    float *h_out, float *pre_out, int stage) {
     try {
         const Cfg &c = m->c;
         const size_t n = (size_t)c.hc * c.dim;
