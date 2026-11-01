@@ -86,8 +86,9 @@ def main():
     passes = [(il, 0) for il in layers] + [(il, s) for il in layers if model.layers[il].engram is not None for s in (1, 2)]
     if stages:
         passes = [(il, s) for il in layers for s in stages]
+    prev = {}  # (layer, stage) -> outputs of the earlier pass: a repeated stage checks determinism
     for il, stage in passes:
-        errs, flips, stats = [], [], []
+        errs, flips, stats, outs = [], [], [], []
         for pos, r in enumerate(rec[il]):
             h = {2: r["h_block"], 3: r["attn_in"], 4: r["ffn_in"]}.get(stage, r["h"]).flatten().contiguous()
             pre = r["pre"].contiguous()
@@ -97,6 +98,7 @@ def main():
             if stage == 1 or stage >= 3:
                 pre_out.copy_(r["pre_out"])
             got = out[: want.numel()]
+            outs.append(got.clone())
             if stage == 4:
                 k = lib.stbl_last_route(eng, route)
                 if sorted(route[:k]) != r["route"]:
@@ -115,6 +117,10 @@ def main():
             print(f"layer {il} route mismatches {len(flips)}/{len(errs)} (pos, ref margin, differing ids): {flips}", flush=True)
         print(f"layer {il} {['engram+block', 'engram only', 'block only', 'attention only', 'moe only'][stage]}: rel err median {es.median():.1e} max {es.max():.1e}; worst (err, pre_mix err, pos): "
               + "  ".join(f"({e:.1e},{p:.0e},{q})" for e, p, q in worst), flush=True)
+        if (il, stage) in prev:
+            diff = [pos for pos, (a, b) in enumerate(zip(prev[il, stage], outs)) if not torch.equal(a, b)]
+            print(f"layer {il} stage {stage} repeat: {len(diff)} positions differ from the earlier pass {diff[:20]}", flush=True)
+        prev[il, stage] = outs
         l2s = torch.tensor([x[0] for x in stats])
         bigs = [x[1] for x in stats]
         print(f"    L2 rel median {l2s.median():.1e} max {l2s.max():.1e}; elements off by >1 ulp: median {sorted(bigs)[len(bigs) // 2]} "

@@ -652,16 +652,18 @@ int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in
         if (pos == 0) m->history.clear();
         if ((int)m->history.size() == pos) m->history.push_back((int64_t)m->token_map[token]);
         if ((int)m->history.size() != pos + 1) throw std::runtime_error("positions must be fed in order");
+        // copies go on m->st: a plain cudaMemcpy runs on the legacy stream, which the non-blocking
+        // m->st does not wait for, and may return before a pageable source reaches the device
         if (stage >= 3) {
-            CK(cudaMemcpy(m->xn, h_in, (size_t)c.dim * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpyAsync(m->xn, h_in, (size_t)c.dim * 4, cudaMemcpyHostToDevice, m->st));
             if (stage == 3) attention(m, il, m->xn, m->sub);
             else moe(m, il, m->xn, m->sub);
             CK(cudaStreamSynchronize(m->st));
             CK(cudaMemcpy(h_out, m->sub, (size_t)c.dim * 4, cudaMemcpyDeviceToHost));
             return 0;
         }
-        CK(cudaMemcpy(m->h, h_in, n * 4, cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(m->pre_mix, pre_in, (size_t)c.hc * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpyAsync(m->h, h_in, n * 4, cudaMemcpyHostToDevice, m->st));
+        CK(cudaMemcpyAsync(m->pre_mix, pre_in, (size_t)c.hc * 4, cudaMemcpyHostToDevice, m->st));
         if (m->L[il].engram >= 0 && stage != 2) engram(m, il);
         if (stage != 1) block(m, il);
         CK(cudaStreamSynchronize(m->st));
