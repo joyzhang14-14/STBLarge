@@ -642,6 +642,29 @@ int stbl_step(stbl_model *m, int token, float *logits) {
     }
 }
 
+int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in, const float *pre_in,
+                    float *h_out, float *pre_out) {
+    try {
+        const Cfg &c = m->c;
+        const size_t n = (size_t)c.hc * c.dim;
+        m->pos = pos;
+        if (pos == 0) m->history.clear();
+        if ((int)m->history.size() == pos) m->history.push_back((int64_t)m->token_map[token]);
+        if ((int)m->history.size() != pos + 1) throw std::runtime_error("positions must be fed in order");
+        CK(cudaMemcpy(m->h, h_in, n * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(m->pre_mix, pre_in, (size_t)c.hc * 4, cudaMemcpyHostToDevice));
+        if (m->L[il].engram >= 0) engram(m, il);
+        block(m, il);
+        CK(cudaStreamSynchronize(m->st));
+        CK(cudaMemcpy(h_out, m->h, n * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(pre_out, m->pre_mix, (size_t)c.hc * 4, cudaMemcpyDeviceToHost));
+        return 0;
+    } catch (const std::exception &e) {
+        m->err = e.what();
+        return -1;
+    }
+}
+
 int stbl_vocab(const stbl_model *m) { return m->c.vocab; }
 const char *stbl_error(const stbl_model *m) { return m->err.c_str(); }
 
