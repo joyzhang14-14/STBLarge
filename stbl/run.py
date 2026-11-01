@@ -42,6 +42,14 @@ def main():
     lib.stbl_error.restype = ctypes.c_char_p
     lib.stbl_error.argtypes = [ctypes.c_void_p]
     lib.stbl_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+    lib.stbl_timing.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+
+    def snapshot():
+        sec = (ctypes.c_double * 16)()
+        n = lib.stbl_timing(m, sec, 16)
+        hits, misses = ctypes.c_uint64(), ctypes.c_uint64()
+        lib.stbl_stats(m, ctypes.byref(hits), ctypes.byref(misses))
+        return list(sec[:n]), hits.value, misses.value
     err = ctypes.create_string_buffer(512)
     t0 = time.time()
     m = lib.stbl_open(GGUF.encode(), a.ctx, a.experts, err, 512)
@@ -58,6 +66,7 @@ def main():
         if nxt < 0:
             sys.exit(f"stbl: {lib.stbl_error(m).decode()}")
     print(f"stbl: prefill {len(ids) / (time.time() - t0):.2f} tok/s", flush=True)
+    before = snapshot()
     out_ids, all_logits = [], []
     t0 = time.time()
     for step in range(a.tokens):
@@ -70,9 +79,15 @@ def main():
         if nxt < 0:
             sys.exit(f"stbl: {lib.stbl_error(m).decode()}")
     dt = time.time() - t0
-    hits, misses = ctypes.c_uint64(), ctypes.c_uint64()
-    lib.stbl_stats(m, ctypes.byref(hits), ctypes.byref(misses))
-    print(f"stbl: generation {max(len(out_ids) - 1, 1) / dt:.2f} tok/s, experts hit {hits.value} miss {misses.value}", flush=True)
+    after = snapshot()
+    steps = max(len(out_ids) - 1, 1)
+    print(f"stbl: generation {steps / dt:.2f} tok/s, experts hit {after[1]} miss {after[2]}"
+          f" (generation: {(after[2] - before[2]) / steps:.1f} misses/token)", flush=True)
+    if os.environ.get("STBL_TIMING", "0") not in ("", "0"):
+        names = ["hc/norm", "engram", "attention", "router", "expert read", "expert compute", "shared expert", "head"]
+        per = [(a_ - b_) / steps * 1000 for a_, b_ in zip(after[0], before[0])]
+        print("stbl: timing ms/token " + "  ".join(f"{n} {v:.1f}" for n, v in zip(names, per))
+              + f"  total {sum(per):.1f}", flush=True)
     torch.save({"prompt_ids": ids, "ids": out_ids, "logits": torch.stack(all_logits), "text": tok.decode(out_ids)}, a.out)
     print("stbl: text", repr(tok.decode(out_ids)))
 

@@ -24,6 +24,9 @@ void stbl_stats(const stbl_model *m, uint64_t *expert_hits, uint64_t *expert_mis
 // 3: attention only, 4: MoE only (3/4: h_in = the normed sublayer input, h_out = its output, dim floats).
 int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in, const float *pre_in,
                     float *h_out, float *pre_out, int stage);
+// STBL_TIMING totals in seconds, in the order hc/norm, engram, attention, router, expert read,
+// expert compute, shared expert, head; returns the number of sections.
+int stbl_timing(const stbl_model *m, double *sec, int n);
 // Routed expert ids of the last MoE call, top-k order; returns top-k.
 int stbl_last_route(const stbl_model *m, int *ids);
 void stbl_close(stbl_model *m);

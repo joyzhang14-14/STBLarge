@@ -3,6 +3,8 @@
 // Engram rows are read from the file on lookup; everything else is resident on the GPU.
 // STBL_DUMP=FILE appends the residual stream (hc x dim fp32) after every layer of every token;
 // STBL_DUMP_ROUTES=FILE appends the routed expert ids (int32, top-k order) of every layer.
+// STBL_TIMING=1 syncs the stream at every section boundary and adds the wall time to per-section
+// totals (stbl_timing); it slows decoding down, so it is for measurement runs only.
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <math.h>
@@ -12,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <list>
 #include <numeric>
 #include <stdexcept>
@@ -60,6 +63,8 @@ struct Layer {
     float *comp_state_kv = nullptr, *comp_state_sc = nullptr;  // ratio > 1: [ratio][head_dim]
 };
 
+enum TimeCat { T_HC, T_ENGRAM, T_ATTN, T_ROUTER, T_READ, T_EXPERT, T_SHARED, T_HEAD, T_N };
+
 struct ExpertCache {
     int slots = 0;
     uint64_t slot_bytes = 0;
@@ -97,6 +102,11 @@ struct stbl_model {
     std::vector<int> topk_shared, last_route;
     std::vector<char> candidates;
     FILE *dump = nullptr, *dump_routes = nullptr;
+    // STBL_TIMING
+    bool timing = false;
+    int tcat = T_HC;
+    double tsum[T_N] = {};
+    std::chrono::steady_clock::time_point tlast;
 };
 
 namespace {
@@ -178,6 +188,16 @@ void gemv(stbl_model *m, const Linear &l, float *y, const float *x, bool round_o
     }
 }
 
+// Start timing section `cat`: the time since the previous mark goes to the previous section.
+void mark(stbl_model *m, int cat) {
+    if (!m->timing) return;
+    CK(cudaStreamSynchronize(m->st));
+    const auto now = std::chrono::steady_clock::now();
+    m->tsum[m->tcat] += std::chrono::duration<double>(now - m->tlast).count();
+    m->tlast = now;
+    m->tcat = cat;
+}
+
 std::vector<float> to_host(stbl_model *m, const float *d, int n) {
     std::vector<float> v(n);
     CK(cudaMemcpyAsync(v.data(), d, (size_t)n * 4, cudaMemcpyDeviceToHost, m->st));
@@ -227,6 +247,7 @@ const uint8_t *expert(stbl_model *m, int layer, int e) {
 void moe(stbl_model *m, int il, const float *x, float *out) {
     const Cfg &c = m->c;
     Layer &l = m->L[il];
+    mark(m, T_ROUTER);
     stbl_gemv_f32(m->router, l.gate_w, x, c.experts, c.dim, 0, m->st);
     stbl_sqrt_softplus(m->router, c.experts, m->st);
     const std::vector<float> sc = to_host(m, m->router, c.experts);
@@ -251,7 +272,9 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
         float w = sc[e];
         w /= sum + 1e-20f;
         w *= c.route_scale;
+        mark(m, T_READ);
         const uint8_t *ew = expert(m, il, e);
+        mark(m, T_EXPERT);
         stbl_gemv_mxfp4(m->moe_g, ew, m->moe_xq, c.inter, c.dim, m->st);
         stbl_gemv_mxfp4(m->moe_u, ew + up, m->moe_xq, c.inter, c.dim, m->st);
         stbl_swiglu(m->moe_mid, m->moe_g, m->moe_u, w, c.swiglu_limit, c.inter, m->st);
@@ -259,6 +282,7 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
         stbl_gemv_mxfp4(m->moe_out, ew + down, m->moe_mid, c.dim, c.inter, m->st);
         stbl_axpy(m->moe_y, m->moe_out, 1.f, c.dim, m->st);
     }
+    mark(m, T_SHARED);
     gemv(m, l.sh_w1, m->moe_g, x, true);
     gemv(m, l.sh_w3, m->moe_u, x, true);
     stbl_swiglu(m->moe_mid, m->moe_g, m->moe_u, 1.f, c.swiglu_limit, c.inter, m->st);
@@ -266,6 +290,7 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     stbl_axpy(m->moe_y, m->moe_out, 1.f, c.dim, m->st);
     CK(cudaMemcpyAsync(out, m->moe_y, (size_t)c.dim * 4, cudaMemcpyDeviceToDevice, m->st));
     stbl_round_bf16(out, c.dim, m->st);
+    mark(m, T_HC);
 }
 
 // ---- attention ------------------------------------------------------------------------------------
@@ -396,6 +421,7 @@ void engram(stbl_model *m, int il) {
     const Cfg &c = m->c;
     Layer &l = m->L[il];
     const int li = l.engram, n = (int)m->history.size() - 1;  // n = current position
+    mark(m, T_ENGRAM);
     const int per_layer = (m->eng_ngram - 1) * m->eng_heads;
     std::vector<int64_t> rows(per_layer);
     uint64_t rolling = 0;
@@ -420,6 +446,7 @@ void engram(stbl_model *m, int il) {
     gemv(m, l.eng_kv, m->eng_kv, m->eng_vals, true);
     stbl_engram_gate(m->h, m->eng_kv, l.eng_q, l.eng_k, c.dim, c.hc, c.eps, m->st);
     CK(cudaStreamSynchronize(m->st));  // eng_stage is reused next time
+    mark(m, T_HC);
 }
 
 // ---- block / forward ---------------------------------------------------------------------------------
@@ -433,7 +460,9 @@ void block(stbl_model *m, int il) {
                   c.sinkhorn, c.eps, c.hc_eps, m->st);
     stbl_hc_pre(m->t0, m->h, m->pre_mix, c.hc, c.dim, m->st);
     stbl_rms_norm(m->xn, m->t0, l.norm[0], 1, c.dim, c.eps, m->st);
+    mark(m, T_ATTN);
     attention(m, il, m->xn, m->sub);
+    mark(m, T_HC);
     stbl_hc_post(m->h, m->sub, m->res, m->post, m->comb, c.hc, c.dim, m->st);
     CK(cudaMemcpyAsync(m->res, m->h, (size_t)n * 4, cudaMemcpyDeviceToDevice, m->st));
     stbl_hc_mixes(m->pre_ffn, m->post, m->comb, m->h, l.hc_fn[1], l.hc_scale[1], l.hc_base[1], c.hc, c.dim,
@@ -461,10 +490,12 @@ int forward(stbl_model *m, int token, float *logits_out) {
             fwrite(h.data(), 4, h.size(), m->dump);
         }
     }
+    mark(m, T_HEAD);
     stbl_hc_pre(m->t0, m->h, m->pre_mix, c.hc, c.dim, m->st);
     stbl_rms_norm(m->xn, m->t0, m->out_norm, 1, c.dim, c.eps, m->st);
     stbl_gemv_bf16(m->logits, m->head, m->xn, c.vocab, c.dim, 0, 0, m->st);
     std::vector<float> lg = to_host(m, m->logits, c.vocab);
+    mark(m, T_HC);
     m->pos++;
     if (logits_out) memcpy(logits_out, lg.data(), lg.size() * 4);
     return (int)(std::max_element(lg.begin(), lg.end()) - lg.begin());
@@ -613,6 +644,9 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->logits = dalloc(c.vocab);
     CK(cudaMalloc(&m->attn_idx, (size_t)(c.window + c.index_topk + 8) * sizeof(int)));
     CK(cudaDeviceSynchronize());  // the uploads and memsets above ran on the legacy stream, which m->st does not wait for
+    const char *timing = getenv("STBL_TIMING");
+    m->timing = timing && timing[0] && timing[0] != '0';
+    m->tlast = std::chrono::steady_clock::now();
     const char *dump = getenv("STBL_DUMP");
     if (dump && dump[0] && !(m->dump = fopen(dump, "wb"))) throw std::runtime_error("cannot open STBL_DUMP");
     const char *routes = getenv("STBL_DUMP_ROUTES");
@@ -680,6 +714,11 @@ int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in
 int stbl_last_route(const stbl_model *m, int *ids) {
     std::copy(m->last_route.begin(), m->last_route.end(), ids);
     return (int)m->last_route.size();
+}
+
+int stbl_timing(const stbl_model *m, double *sec, int n) {
+    for (int i = 0; i < n && i < T_N; i++) sec[i] = m->tsum[i];
+    return T_N;
 }
 
 int stbl_vocab(const stbl_model *m) { return m->c.vocab; }
