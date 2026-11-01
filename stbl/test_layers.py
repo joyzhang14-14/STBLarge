@@ -65,8 +65,8 @@ def main():
     eng = lib.stbl_open(GGUF.encode(), 1024, 400, err, 512)
     if not eng:
         sys.exit(f"stbl: {err.value.decode()}")
-    out = torch.empty(4 * args.dim, dtype=torch.float32)
-    pre_out = torch.empty(4, dtype=torch.float32)
+    out = torch.empty(4 * args.dim, dtype=torch.float32, device="cpu")  # host buffers for the C API
+    pre_out = torch.empty(4, dtype=torch.float32, device="cpu")
     for il in layers:
         errs = []
         for pos, r in enumerate(rec[il]):
