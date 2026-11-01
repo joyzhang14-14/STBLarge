@@ -612,6 +612,7 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->eng_vals = dalloc(64 * 256); m->eng_kv = dalloc((size_t)(c.hc + 1) * c.dim);
     m->logits = dalloc(c.vocab);
     CK(cudaMalloc(&m->attn_idx, (size_t)(c.window + c.index_topk + 8) * sizeof(int)));
+    CK(cudaDeviceSynchronize());  // the uploads and memsets above ran on the legacy stream, which m->st does not wait for
     const char *dump = getenv("STBL_DUMP");
     if (dump && dump[0] && !(m->dump = fopen(dump, "wb"))) throw std::runtime_error("cannot open STBL_DUMP");
     const char *routes = getenv("STBL_DUMP_ROUTES");
