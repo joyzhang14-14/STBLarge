@@ -94,7 +94,7 @@ struct stbl_model {
     float *router, *moe_xq, *moe_g, *moe_u, *moe_mid, *moe_out, *moe_y, *eng_vals, *eng_kv, *logits;
     int *attn_idx;
     ExpertCache ec;
-    std::vector<int> topk_shared;
+    std::vector<int> topk_shared, last_route;
     std::vector<char> candidates;
     FILE *dump = nullptr, *dump_routes = nullptr;
 };
@@ -239,6 +239,7 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     });
     float sum = 0.f;
     for (int i = 0; i < c.topk; i++) sum += sc[order[i]];
+    m->last_route.assign(order.begin(), order.begin() + c.topk);
     if (m->dump_routes)
         for (int i = 0; i < c.topk; i++) fwrite(&order[i], 4, 1, m->dump_routes);
     CK(cudaMemsetAsync(m->moe_y, 0, (size_t)c.dim * 4, m->st));
@@ -651,6 +652,14 @@ int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in
         if (pos == 0) m->history.clear();
         if ((int)m->history.size() == pos) m->history.push_back((int64_t)m->token_map[token]);
         if ((int)m->history.size() != pos + 1) throw std::runtime_error("positions must be fed in order");
+        if (stage >= 3) {
+            CK(cudaMemcpy(m->xn, h_in, (size_t)c.dim * 4, cudaMemcpyHostToDevice));
+            if (stage == 3) attention(m, il, m->xn, m->sub);
+            else moe(m, il, m->xn, m->sub);
+            CK(cudaStreamSynchronize(m->st));
+            CK(cudaMemcpy(h_out, m->sub, (size_t)c.dim * 4, cudaMemcpyDeviceToHost));
+            return 0;
+        }
         CK(cudaMemcpy(m->h, h_in, n * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(m->pre_mix, pre_in, (size_t)c.hc * 4, cudaMemcpyHostToDevice));
         if (m->L[il].engram >= 0 && stage != 2) engram(m, il);
@@ -663,6 +672,11 @@ int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in
         m->err = e.what();
         return -1;
     }
+}
+
+int stbl_last_route(const stbl_model *m, int *ids) {
+    std::copy(m->last_route.begin(), m->last_route.end(), ids);
+    return (int)m->last_route.size();
 }
 
 int stbl_vocab(const stbl_model *m) { return m->c.vocab; }
