@@ -45,6 +45,7 @@ def main():
         def pre(mod, a, il=il):
             if mod.engram is None:
                 rec[il].append({"h": a[0][0, 0].float().cpu()})
+            rec[il][-1]["h_block"] = a[0][0, 0].float().cpu()
             rec[il][-1]["pre"] = a[2][0, 0].float().cpu()
         def post(mod, a, out, il=il):
             rec[il][-1]["out"] = out[0][0, 0].float().cpu()
@@ -58,7 +59,7 @@ def main():
     lib = ctypes.CDLL(os.path.join(HERE, "libstbl.so"))
     lib.stbl_open.restype = ctypes.c_void_p
     lib.stbl_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-    lib.stbl_block_test.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 4
+    lib.stbl_block_test.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 4 + [ctypes.c_int]
     lib.stbl_error.restype = ctypes.c_char_p
     lib.stbl_error.argtypes = [ctypes.c_void_p]
     err = ctypes.create_string_buffer(512)
@@ -67,19 +68,23 @@ def main():
         sys.exit(f"stbl: {err.value.decode()}")
     out = torch.empty(4 * args.dim, dtype=torch.float32, device="cpu")  # host buffers for the C API
     pre_out = torch.empty(4, dtype=torch.float32, device="cpu")
-    for il in layers:
+    passes = [(il, 0) for il in layers] + [(il, s) for il in layers if model.layers[il].engram is not None for s in (1, 2)]
+    for il, stage in passes:
         errs = []
         for pos, r in enumerate(rec[il]):
-            h, pre = r["h"].flatten().contiguous(), r["pre"].contiguous()
-            if lib.stbl_block_test(eng, il, pos, ids[pos], h.data_ptr(), pre.data_ptr(), out.data_ptr(), pre_out.data_ptr()):
+            h = (r["h_block"] if stage == 2 else r["h"]).flatten().contiguous()
+            pre = r["pre"].contiguous()
+            if lib.stbl_block_test(eng, il, pos, ids[pos], h.data_ptr(), pre.data_ptr(), out.data_ptr(), pre_out.data_ptr(), stage):
                 sys.exit(f"stbl: {lib.stbl_error(eng).decode()}")
-            want = r["out"].flatten()
+            want = (r["h_block"] if stage == 1 else r["out"]).flatten()
+            if stage == 1:
+                pre_out.copy_(r["pre_out"])
             e = float((out - want).abs().max() / want.abs().max())
             ep = float((pre_out - r["pre_out"]).abs().max())
             errs.append((e, ep, pos))
         es = torch.tensor([x[0] for x in errs])
         worst = sorted(errs, reverse=True)[:6]
-        print(f"layer {il}: rel err median {es.median():.1e} max {es.max():.1e}; worst (err, pre_mix err, pos): "
+        print(f"layer {il} {['engram+block', 'engram only', 'block only'][stage]}: rel err median {es.median():.1e} max {es.max():.1e}; worst (err, pre_mix err, pos): "
               + "  ".join(f"({e:.1e},{p:.0e},{q})" for e, p, q in worst), flush=True)
 
 

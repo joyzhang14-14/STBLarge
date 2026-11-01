@@ -653,8 +653,8 @@ int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in
         if ((int)m->history.size() != pos + 1) throw std::runtime_error("positions must be fed in order");
         CK(cudaMemcpy(m->h, h_in, n * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(m->pre_mix, pre_in, (size_t)c.hc * 4, cudaMemcpyHostToDevice));
-        if (m->L[il].engram >= 0) engram(m, il);
-        block(m, il);
+        if (m->L[il].engram >= 0 && stage != 2) engram(m, il);
+        if (stage != 1) block(m, il);
         CK(cudaStreamSynchronize(m->st));
         CK(cudaMemcpy(h_out, m->h, n * 4, cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(pre_out, m->pre_mix, (size_t)c.hc * 4, cudaMemcpyDeviceToHost));
