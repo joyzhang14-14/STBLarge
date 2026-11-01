@@ -211,14 +211,14 @@ __global__ void k_hc_mixes(float *pre, float *post, float *comb, const float *x,
     __syncthreads();
     if (threadIdx.x != 0) return;
     for (int j = 0; j < hc; j++) {
-        pre[j] = 1.f / (1.f + expf(-(mixes[j] * scale[0] + base[j]))) + hc_eps;
-        post[j] = 2.f / (1.f + expf(-(mixes[j + hc] * scale[1] + base[j + hc])));
+        pre[j] = 1.f / (1.f + expf(-__fadd_rn(__fmul_rn(mixes[j], scale[0]), base[j]))) + hc_eps;
+        post[j] = 2.f / (1.f + expf(-__fadd_rn(__fmul_rn(mixes[j + hc], scale[1]), base[j + hc])));
     }
     float c[16];
     for (int j = 0; j < hc; j++) {
         float mx = -INFINITY;
         for (int k = 0; k < hc; k++) {
-            c[j * hc + k] = mixes[2 * hc + j * hc + k] * scale[2] + base[2 * hc + j * hc + k];
+            c[j * hc + k] = __fadd_rn(__fmul_rn(mixes[2 * hc + j * hc + k], scale[2]), base[2 * hc + j * hc + k]);
             mx = fmaxf(mx, c[j * hc + k]);
         }
         float sum = 0.f;
@@ -241,24 +241,26 @@ __global__ void k_hc_mixes(float *pre, float *post, float *comb, const float *x,
     for (int i = 0; i < hc * hc; i++) comb[i] = c[i];
 }
 
-// hc_pre: out[d] = bf16(sum_j pre[j] * x[j][d]).
+// hc_pre: out[d] = bf16(sum_j pre[j] * x[j][d]). Like torch: each product rounded, summed in j order
+// (no FMA contraction), so the result matches the reference bit for bit.
 __global__ void k_hc_pre(float *out, const float *x, const float *pre, int hc, int dim) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= dim) return;
     float s = 0.f;
-    for (int j = 0; j < hc; j++) s += pre[j] * x[(size_t)j * dim + d];
+    for (int j = 0; j < hc; j++) s = __fadd_rn(s, __fmul_rn(pre[j], x[(size_t)j * dim + d]));
     out[d] = bf16r(s);
 }
 
-// hc_post: out[j][d] = bf16(post[j] * x[d] + sum_i comb[i][j] * res[i][d]).
+// hc_post: out[j][d] = bf16(post[j] * x[d] + sum_i comb[i][j] * res[i][d]), rounded step by step like
+// torch (see hc_pre).
 __global__ void k_hc_post(float *out, const float *x, const float *res, const float *post, const float *comb,
                           int hc, int dim) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= hc * dim) return;
     const int j = i / dim, d = i % dim;
     float s = 0.f;
-    for (int a = 0; a < hc; a++) s += comb[a * hc + j] * res[(size_t)a * dim + d];
-    out[i] = bf16r(post[j] * x[d] + s);
+    for (int a = 0; a < hc; a++) s = __fadd_rn(s, __fmul_rn(comb[a * hc + j], res[(size_t)a * dim + d]));
+    out[i] = bf16r(__fadd_rn(__fmul_rn(post[j], x[d]), s));
 }
 
 // Sparse decode attention: q [heads][d]; idx picks rows (-1 = none) from the window cache kv1 (idx < n1)
