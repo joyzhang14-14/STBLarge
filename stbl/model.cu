@@ -5,7 +5,8 @@
 // STBL_DUMP_ROUTES=FILE appends the routed expert ids (int32, top-k order) of every layer.
 // STBL_READ_THREADS=N (default 4) reads the missing experts of a layer in 2 MiB pieces with N threads.
 // STBL_TIMING=1 syncs the stream at every section boundary and adds the wall time to per-section
-// totals (stbl_timing); it slows decoding down, so it is for measurement runs only.
+// totals (stbl_timing); it slows decoding down and serializes the expert reads with the GPU work they
+// otherwise overlap, so it is for measurement runs only.
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <math.h>
@@ -101,7 +102,7 @@ struct stbl_model {
     // activations
     float *h, *h2, *res, *xn, *sub, *xq, *pre_mix, *pre_attn, *pre_ffn, *post, *comb;
     float *t0, *qr, *q, *latent, *kbuf, *o, *low, *idx_q, *idx_w, *idx_score;
-    float *router, *moe_xq, *moe_g, *moe_u, *moe_mid, *moe_out, *moe_y, *eng_vals, *eng_kv, *logits;
+    float *router, *moe_xq, *moe_g, *moe_u, *moe_mid, *moe_out, *moe_eo, *moe_y, *eng_vals, *eng_kv, *logits;
     int *attn_idx;
     ExpertCache ec;
     // expert readers: one pinned stage and copy stream each; dfd is the O_DIRECT descriptor (-1: buffered)
@@ -313,38 +314,49 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
         for (int i = 0; i < c.topk; i++) fwrite(&order[i], 4, 1, m->dump_routes);
     // m->st is idle here (to_host synced it), so evicted slots are no longer read by earlier kernels.
     // Cached experts of this layer are touched first so that a miss cannot evict one of them.
-    mark(m, T_READ);
     for (int i = 0; i < c.topk; i++) {
         auto it = m->ec.where.find((uint64_t)il << 32 | (uint32_t)order[i]);
         if (it != m->ec.where.end()) m->ec.lru.splice(m->ec.lru.begin(), m->ec.lru, it->second.second);
     }
     std::vector<Piece> ps;
     std::vector<const uint8_t *> ew(c.topk);
-    for (int i = 0; i < c.topk; i++) ew[i] = expert(m, il, order[i], ps);
-    read_pieces(m, ps);
-    mark(m, T_ROUTER);
+    std::vector<char> missing(c.topk);
+    for (int i = 0; i < c.topk; i++) {
+        const size_t before = ps.size();
+        ew[i] = expert(m, il, order[i], ps);
+        missing[i] = ps.size() > before;
+    }
     CK(cudaMemsetAsync(m->moe_y, 0, (size_t)c.dim * 4, m->st));
     CK(cudaMemcpyAsync(m->moe_xq, x, (size_t)c.dim * 4, cudaMemcpyDeviceToDevice, m->st));
     stbl_act_quant_fp8(m->moe_xq, c.dim, m->st);
     const uint64_t up = l.exp_bytes[0], down = l.exp_bytes[0] + l.exp_bytes[1];
-    for (int i = 0; i < c.topk; i++) {
-        const int e = order[i];
-        float w = sc[e];
+    // expert i's output goes to moe_eo[i]; the outputs are added in top-k order at the end, so queueing
+    // the cached experts and the shared expert before the reads finish does not change the sums
+    auto run_expert = [&](int i) {
+        float w = sc[order[i]];
         w /= sum + 1e-20f;
         w *= c.route_scale;
-        if (i == 0) mark(m, T_EXPERT);
         stbl_gemv_mxfp4(m->moe_g, ew[i], m->moe_xq, c.inter, c.dim, m->st);
         stbl_gemv_mxfp4(m->moe_u, ew[i] + up, m->moe_xq, c.inter, c.dim, m->st);
         stbl_swiglu(m->moe_mid, m->moe_g, m->moe_u, w, c.swiglu_limit, c.inter, m->st);
         stbl_act_quant_fp8(m->moe_mid, c.inter, m->st);
-        stbl_gemv_mxfp4(m->moe_out, ew[i] + down, m->moe_mid, c.dim, c.inter, m->st);
-        stbl_axpy(m->moe_y, m->moe_out, 1.f, c.dim, m->st);
-    }
+        stbl_gemv_mxfp4(m->moe_eo + (size_t)i * c.dim, ew[i] + down, m->moe_mid, c.dim, c.inter, m->st);
+    };
+    mark(m, T_EXPERT);
+    for (int i = 0; i < c.topk; i++)
+        if (!missing[i]) run_expert(i);
     mark(m, T_SHARED);
     gemv(m, l.sh_w1, m->moe_g, x, true);
     gemv(m, l.sh_w3, m->moe_u, x, true);
     stbl_swiglu(m->moe_mid, m->moe_g, m->moe_u, 1.f, c.swiglu_limit, c.inter, m->st);
     gemv(m, l.sh_w2, m->moe_out, m->moe_mid, true);
+    mark(m, T_READ);
+    read_pieces(m, ps);  // the GPU runs the kernels queued above meanwhile
+    mark(m, T_EXPERT);
+    for (int i = 0; i < c.topk; i++) {
+        if (missing[i]) run_expert(i);
+    }
+    for (int i = 0; i < c.topk; i++) stbl_axpy(m->moe_y, m->moe_eo + (size_t)i * c.dim, 1.f, c.dim, m->st);
     stbl_axpy(m->moe_y, m->moe_out, 1.f, c.dim, m->st);
     CK(cudaMemcpyAsync(out, m->moe_y, (size_t)c.dim * 4, cudaMemcpyDeviceToDevice, m->st));
     stbl_round_bf16(out, c.dim, m->st);
@@ -756,6 +768,7 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->idx_q = dalloc((size_t)c.ih * c.idim); m->idx_w = dalloc(c.ih); m->idx_score = dalloc(ctx);
     m->router = dalloc(c.experts); m->moe_xq = dalloc(c.dim); m->moe_g = dalloc(c.inter); m->moe_u = dalloc(c.inter);
     m->moe_mid = dalloc(c.inter); m->moe_out = dalloc(c.dim); m->moe_y = dalloc(c.dim);
+    m->moe_eo = dalloc((size_t)c.topk * c.dim);
     m->eng_vals = dalloc(64 * 256); m->eng_kv = dalloc((size_t)(c.hc + 1) * c.dim);
     m->logits = dalloc(c.vocab);
     CK(cudaMalloc(&m->attn_idx, (size_t)(c.window + c.index_topk + 8) * sizeof(int)));
