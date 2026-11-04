@@ -67,3 +67,17 @@ bench_mxfp4(DIM, INTER)
 bench_fp8(INTER, DIM)
 bench_fp8(DIM, INTER)
 bench_bf16(4096, DIM)
+
+
+def bench_hc_mixes(hc=4, iters=20):
+    n, mix = hc * DIM, (2 + hc) * hc
+    x = torch.randn(n, device=dev)
+    fn = torch.randn(mix, n, device=dev) * 0.01
+    scale, base = torch.ones(3, device=dev), torch.zeros(mix, device=dev)
+    pre, post, comb = (torch.empty(t, device=dev) for t in (hc, hc, hc * hc))
+    Fl = ctypes.c_float
+    report(f"hc_mixes hc={hc}", *timed(lambda: lib.stbl_hc_mixes(*(P(t.data_ptr()) for t in (pre, post, comb, x, fn, scale, base)),
+                                                              I(hc), I(DIM), I(iters), Fl(1e-6), Fl(1e-6), None), fn.numel() * 4))
+
+
+bench_hc_mixes()

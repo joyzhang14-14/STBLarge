@@ -205,63 +205,66 @@ __global__ void k_rope(float *x, const float *cos_sin, int heads, int width, int
 
 // Hyper-connection mixes: mixes[m] = (hc_fn[m] . x) * rsqrt(mean(x^2) + eps) over the flattened
 // hc*dim stream, then the official hc_split_sinkhorn. One block of 256 threads.
-__global__ void k_hc_mixes(float *pre, float *post, float *comb, const float *x, const float *fn,
-                           const float *scale, const float *base, int hc, int dim, int iters,
-                           float norm_eps, float hc_eps) {
-    const int n = hc * dim, mix = (2 + hc) * hc;
-    __shared__ float part[8][32];
-    __shared__ float mixes[64];
-    __shared__ float sq;
-    // sum of squares
-    float s = 0.f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) s += x[i] * x[i];
-    s = warp_sum(s);
-    if ((threadIdx.x & 31) == 0) part[0][threadIdx.x / 32] = s;
+// The mix dot products (and, as row `mix`, the sum of squares) in kHcSlices slices per row, one
+// 256-thread block per (slice, row); k_hc_mixes adds the slices in order. One partial buffer: the
+// engine runs one stream.
+constexpr int kHcSlices = 8;
+__device__ float g_hc_part[65 * kHcSlices];
+
+__global__ void k_hc_dot(const float *x, const float *fn, int n, int mix) {
+    __shared__ float part[8];
+    const int s = blockIdx.x, m = blockIdx.y, len = n / kHcSlices;
+    const float *w = m < mix ? fn + (size_t)m * n : x;
+    float a = 0.f;
+    for (int i = s * len + threadIdx.x; i < (s + 1) * len; i += blockDim.x) a += w[i] * x[i];
+    a = warp_sum(a);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x / 32] = a;
     __syncthreads();
     if (threadIdx.x == 0) {
         float t = 0.f;
-        for (int w = 0; w < (int)blockDim.x / 32; w++) t += part[0][w];
-        sq = rsqrtf(t / n + norm_eps);
+        for (int i = 0; i < (int)blockDim.x / 32; i++) t += part[i];
+        g_hc_part[m * kHcSlices + s] = t;
     }
-    __syncthreads();
-    // one warp per mix row
-    for (int m = threadIdx.x / 32; m < mix; m += blockDim.x / 32) {
+}
+
+__global__ void k_hc_mixes(float *pre, float *post, float *comb, const float *scale, const float *base, int hc,
+                           int dim, int iters, float norm_eps, float hc_eps) {
+    const int n = hc * dim, mix = (2 + hc) * hc;
+    __shared__ float mixes[65];
+    if ((int)threadIdx.x <= mix) {  // thread m adds the slices of row m
         float a = 0.f;
-        for (int i = threadIdx.x & 31; i < n; i += 32) a += fn[(size_t)m * n + i] * x[i];
-        a = warp_sum(a);
-        if ((threadIdx.x & 31) == 0) mixes[m] = a * sq;
+        for (int s = 0; s < kHcSlices; s++) a += g_hc_part[threadIdx.x * kHcSlices + s];
+        mixes[threadIdx.x] = a;
     }
     __syncthreads();
-    if (threadIdx.x != 0) return;
-    for (int j = 0; j < hc; j++) {
-        pre[j] = 1.f / (1.f + expf(-__fadd_rn(__fmul_rn(mixes[j], scale[0]), base[j]))) + hc_eps;
-        post[j] = 2.f / (1.f + expf(-__fadd_rn(__fmul_rn(mixes[j + hc], scale[1]), base[j + hc])));
+    // One warp from here: lane j * hc + k holds comb[j][k] and gathers its row or column by shuffles,
+    // adding in index order like the serial loops of the reference.
+    if (threadIdx.x >= 32) return;
+    const int lane = threadIdx.x, j = lane / hc, k = lane % hc;
+    const float sq = rsqrtf(mixes[mix] / n + norm_eps);
+    if (lane < hc) {
+        pre[lane] = 1.f / (1.f + expf(-__fadd_rn(__fmul_rn(mixes[lane] * sq, scale[0]), base[lane]))) + hc_eps;
+        post[lane] = 2.f / (1.f + expf(-__fadd_rn(__fmul_rn(mixes[lane + hc] * sq, scale[1]), base[lane + hc])));
     }
-    float c[16];
-    for (int j = 0; j < hc; j++) {
-        float mx = -INFINITY;
-        for (int k = 0; k < hc; k++) {
-            c[j * hc + k] = __fadd_rn(__fmul_rn(mixes[2 * hc + j * hc + k], scale[2]), base[2 * hc + j * hc + k]);
-            mx = fmaxf(mx, c[j * hc + k]);
-        }
-        float sum = 0.f;
-        for (int k = 0; k < hc; k++) { c[j * hc + k] = expf(c[j * hc + k] - mx); sum += c[j * hc + k]; }
-        for (int k = 0; k < hc; k++) c[j * hc + k] = c[j * hc + k] / sum + hc_eps;
-    }
+    const bool on = lane < hc * hc;
+    float c = on ? __fadd_rn(__fmul_rn(mixes[2 * hc + lane] * sq, scale[2]), base[2 * hc + lane]) : 0.f;
+    float mx = -INFINITY;
+    for (int q = 0; q < hc; q++) mx = fmaxf(mx, __shfl_sync(0xffffffffu, c, j * hc + q));
+    c = expf(c - mx);
+    float sum = 0.f;
+    for (int q = 0; q < hc; q++) sum += __shfl_sync(0xffffffffu, c, j * hc + q);
+    c = c / sum + hc_eps;
     for (int it = 0; it < iters; it++) {
-        if (it > 0)
-            for (int j = 0; j < hc; j++) {
-                float sum = 0.f;
-                for (int k = 0; k < hc; k++) sum += c[j * hc + k];
-                for (int k = 0; k < hc; k++) c[j * hc + k] /= sum + hc_eps;
-            }
-        for (int k = 0; k < hc; k++) {
-            float sum = 0.f;
-            for (int j = 0; j < hc; j++) sum += c[j * hc + k];
-            for (int j = 0; j < hc; j++) c[j * hc + k] /= sum + hc_eps;
+        if (it > 0) {
+            sum = 0.f;
+            for (int q = 0; q < hc; q++) sum += __shfl_sync(0xffffffffu, c, j * hc + q);
+            c /= sum + hc_eps;
         }
+        sum = 0.f;
+        for (int q = 0; q < hc; q++) sum += __shfl_sync(0xffffffffu, c, q * hc + k);
+        c /= sum + hc_eps;
     }
-    for (int i = 0; i < hc * hc; i++) comb[i] = c[i];
+    if (on) comb[lane] = c;
 }
 
 // hc_pre: out[d] = bf16(sum_j pre[j] * x[j][d]). Like torch: each product rounded, summed in j order
@@ -478,7 +481,9 @@ void stbl_rope(float *x, const float *cos_sin, int heads, int width, int rope, i
 }
 void stbl_hc_mixes(float *pre, float *post, float *comb, const float *x, const float *fn, const float *scale,
                    const float *base, int hc, int dim, int iters, float norm_eps, float hc_eps, cudaStream_t st) {
-    k_hc_mixes<<<1, 256, 0, st>>>(pre, post, comb, x, fn, scale, base, hc, dim, iters, norm_eps, hc_eps);
+    const int n = hc * dim, mix = (2 + hc) * hc;  // n % kHcSlices == 0, mix <= 64
+    k_hc_dot<<<dim3(kHcSlices, mix + 1), 256, 0, st>>>(x, fn, n, mix);
+    k_hc_mixes<<<1, 96, 0, st>>>(pre, post, comb, scale, base, hc, dim, iters, norm_eps, hc_eps);
 }
 void stbl_hc_pre(float *out, const float *x, const float *pre, int hc, int dim, cudaStream_t st) {
     k_hc_pre<<<GRID(dim, 256), 256, 0, st>>>(out, x, pre, hc, dim);
