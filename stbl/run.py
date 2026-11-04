@@ -43,6 +43,7 @@ def main():
     lib.stbl_error.argtypes = [ctypes.c_void_p]
     lib.stbl_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
     lib.stbl_timing.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    lib.stbl_lookahead.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
     def snapshot():
         sec = (ctypes.c_double * 16)()
@@ -88,6 +89,11 @@ def main():
         per = [(a_ - b_) / steps * 1000 for a_, b_ in zip(after[0], before[0])]
         print("stbl: timing ms/token " + "  ".join(f"{n} {v:.1f}" for n, v in zip(names, per))
               + f"  total {sum(per):.1f}", flush=True)
+    if os.environ.get("STBL_LOOKAHEAD", "0") not in ("", "0"):
+        la = (ctypes.c_uint64 * 4)()
+        lib.stbl_lookahead(m, la)
+        print(f"stbl: lookahead top {os.environ['STBL_LOOKAHEAD']}: uncached guesses {la[0]}, routed {la[1]}"
+              f" ({la[1] / max(la[0], 1):.0%}); misses {la[2]}, guessed {la[3]} ({la[3] / max(la[2], 1):.0%})", flush=True)
     torch.save({"prompt_ids": ids, "ids": out_ids, "logits": torch.stack(all_logits), "text": tok.decode(out_ids)}, a.out)
     print("stbl: text", repr(tok.decode(out_ids)))
 

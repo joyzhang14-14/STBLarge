@@ -3,6 +3,8 @@
 // Engram rows are read from the file on lookup; everything else is resident on the GPU.
 // STBL_DUMP=FILE appends the residual stream (hc x dim fp32) after every layer of every token;
 // STBL_DUMP_ROUTES=FILE appends the routed expert ids (int32, top-k order) of every layer.
+// STBL_LOOKAHEAD=M scores the next layer's router on this layer's FFN input (the stale-router guess) and
+// counts how many of its top M would have covered the next layer's expert misses (stbl_lookahead).
 // STBL_READ_THREADS=N (default 4) reads the missing experts of a layer in 2 MiB pieces with N threads.
 // STBL_TIMING=1 syncs the stream at every section boundary and adds the wall time to per-section
 // totals (stbl_timing); it slows decoding down and serializes the expert reads with the GPU work they
@@ -55,6 +57,7 @@ struct Layer {
     Linear comp_wkv, comp_gate, idx_wk, idx_wq_b, idx_proj;
     float *comp_norm = nullptr, *idx_k_norm = nullptr;
     float *gate_w, *gate_b;
+    std::vector<float> bias_h;  // gate_b on the host
     Linear sh_w1, sh_w2, sh_w3;
     const uint8_t *exp_w[3];
     uint64_t exp_bytes[3];
@@ -110,6 +113,13 @@ struct stbl_model {
     std::vector<uint8_t *> rstage;
     std::vector<cudaStream_t> rstream;
     std::vector<int> topk_shared, last_route;
+    // STBL_LOOKAHEAD: guessed experts of layer pred_layer, and whether each was uncached when guessed;
+    // la = {uncached guesses, of them routed, misses at guessed layers, of them guessed}
+    int ahead = 0, pred_layer = -1;
+    float *router2 = nullptr;
+    std::vector<int> pred;
+    std::vector<char> pred_cold;
+    uint64_t la[4] = {};
     std::vector<char> candidates;
     FILE *dump = nullptr, *dump_routes = nullptr;
     // STBL_TIMING
@@ -299,8 +309,13 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     mark(m, T_ROUTER);
     stbl_gemv_f32(m->router, l.gate_w, x, c.experts, c.dim, 0, m->st);
     stbl_sqrt_softplus(m->router, c.experts, m->st);
+    const bool ahead = m->ahead > 0 && il + 1 < c.layers;
+    if (ahead) {
+        stbl_gemv_f32(m->router2, m->L[il + 1].gate_w, x, c.experts, c.dim, 0, m->st);
+        stbl_sqrt_softplus(m->router2, c.experts, m->st);
+    }
     const std::vector<float> sc = to_host(m, m->router, c.experts);
-    const std::vector<float> bias = to_host(m, l.gate_b, c.experts);
+    const std::vector<float> &bias = l.bias_h;
     std::vector<int> order(c.experts);
     std::iota(order.begin(), order.end(), 0);
     std::partial_sort(order.begin(), order.begin() + c.topk, order.end(), [&](int a, int b) {
@@ -310,6 +325,29 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     float sum = 0.f;
     for (int i = 0; i < c.topk; i++) sum += sc[order[i]];
     m->last_route.assign(order.begin(), order.begin() + c.topk);
+    if (m->pred_layer == il) {
+        auto routed = [&](int e) { return std::find(order.begin(), order.begin() + c.topk, e) != order.begin() + c.topk; };
+        for (size_t i = 0; i < m->pred.size(); i++)
+            if (m->pred_cold[i]) m->la[0]++, m->la[1] += routed(m->pred[i]);
+        for (int i = 0; i < c.topk; i++)
+            if (!m->ec.where.count((uint64_t)il << 32 | (uint32_t)order[i]))
+                m->la[2]++, m->la[3] += std::find(m->pred.begin(), m->pred.end(), order[i]) != m->pred.end();
+    }
+    if (ahead) {
+        const std::vector<float> s2 = to_host(m, m->router2, c.experts);
+        const std::vector<float> &b2 = m->L[il + 1].bias_h;
+        std::vector<int> o2(c.experts);
+        std::iota(o2.begin(), o2.end(), 0);
+        const int k2 = std::min(m->ahead, c.experts);
+        std::partial_sort(o2.begin(), o2.begin() + k2, o2.end(), [&](int a, int b) {
+            const float va = s2[a] + b2[a], vb = s2[b] + b2[b];
+            return va > vb || (va == vb && a < b);
+        });
+        m->pred.assign(o2.begin(), o2.begin() + k2);
+        m->pred_cold.assign(k2, 0);
+        for (int i = 0; i < k2; i++) m->pred_cold[i] = !m->ec.where.count((uint64_t)(il + 1) << 32 | (uint32_t)m->pred[i]);
+        m->pred_layer = il + 1;
+    }
     if (m->dump_routes)
         for (int i = 0; i < c.topk; i++) fwrite(&order[i], 4, 1, m->dump_routes);
     // m->st is idle here (to_host synced it), so evicted slots are no longer read by earlier kernels.
@@ -702,6 +740,8 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
         }
         l.gate_w = upload_f32(f, b + "ffn_gate_inp.weight");
         l.gate_b = upload_f32(f, b + "exp_probs_b.bias");
+        const float *bh = (const float *)f.data(need(f, b + "exp_probs_b.bias"));
+        l.bias_h.assign(bh, bh + c.experts);
         l.sh_w1 = load_linear(f, b + "ffn_gate_shexp");
         l.sh_w3 = load_linear(f, b + "ffn_up_shexp");
         l.sh_w2 = load_linear(f, b + "ffn_down_shexp");
@@ -769,6 +809,9 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->router = dalloc(c.experts); m->moe_xq = dalloc(c.dim); m->moe_g = dalloc(c.inter); m->moe_u = dalloc(c.inter);
     m->moe_mid = dalloc(c.inter); m->moe_out = dalloc(c.dim); m->moe_y = dalloc(c.dim);
     m->moe_eo = dalloc((size_t)c.topk * c.dim);
+    m->router2 = dalloc(c.experts);
+    const char *ahead = getenv("STBL_LOOKAHEAD");
+    m->ahead = ahead && ahead[0] ? atoi(ahead) : 0;
     m->eng_vals = dalloc(64 * 256); m->eng_kv = dalloc((size_t)(c.hc + 1) * c.dim);
     m->logits = dalloc(c.vocab);
     CK(cudaMalloc(&m->attn_idx, (size_t)(c.window + c.index_topk + 8) * sizeof(int)));
@@ -855,6 +898,10 @@ int stbl_timing(const stbl_model *m, double *sec, int n) {
 
 int stbl_vocab(const stbl_model *m) { return m->c.vocab; }
 const char *stbl_error(const stbl_model *m) { return m->err.c_str(); }
+
+void stbl_lookahead(const stbl_model *m, uint64_t *out) {
+    for (int i = 0; i < 4; i++) out[i] = m->la[i];
+}
 
 void stbl_stats(const stbl_model *m, uint64_t *hits, uint64_t *misses) {
     *hits = m->ec.hits;
