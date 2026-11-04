@@ -232,10 +232,13 @@ float *rope_table(int dim, int ctx, double orig, double base, double factor, dou
 }
 
 // official linear(): FP8 weights quantize their input to FP8 per 32 (power-of-two scales) first
-void gemv(stbl_model *m, const Linear &l, float *y, const float *x, bool round_out) {
+// xq_ready: m->xq already holds the FP8 quantization of x (an FP8 gemv of the same x just ran).
+void gemv(stbl_model *m, const Linear &l, float *y, const float *x, bool round_out, bool xq_ready = false) {
     if (l.type == QT_STBL_E4M3) {
-        CK(cudaMemcpyAsync(m->xq, x, (size_t)l.k * 4, cudaMemcpyDeviceToDevice, m->st));
-        stbl_act_quant_fp8(m->xq, l.k, m->st);
+        if (!xq_ready) {
+            CK(cudaMemcpyAsync(m->xq, x, (size_t)l.k * 4, cudaMemcpyDeviceToDevice, m->st));
+            stbl_act_quant_fp8(m->xq, l.k, m->st);
+        }
         stbl_gemv_fp8(y, l.w, l.s, m->xq, l.rows, l.k, round_out, m->st);
     } else if (l.type == QT_BF16) {
         stbl_gemv_bf16(y, l.w, x, l.rows, l.k, round_out, 0, m->st);
@@ -539,7 +542,7 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     run_experts(false);
     mark(m, T_SHARED);
     gemv(m, l.sh_w1, m->moe_g, x, true);
-    gemv(m, l.sh_w3, m->moe_u, x, true);
+    gemv(m, l.sh_w3, m->moe_u, x, true, l.sh_w1.type == QT_STBL_E4M3);
     stbl_swiglu(m->moe_mid, m->moe_g, m->moe_u, 1.f, c.swiglu_limit, c.inter, m->st);
     gemv(m, l.sh_w2, m->moe_out, m->moe_mid, true);
     mark(m, T_READ);
@@ -650,13 +653,13 @@ void attention(stbl_model *m, int il, const float *x, float *out) {
     const float *cs = (ratio ? m->rope_comp : m->rope_plain) + (size_t)pos * c.rope;
     gemv(m, l.wq_a, m->t0, x, true);
     stbl_rms_norm(m->qr, m->t0, l.q_norm, 1, c.q_rank, c.eps, m->st);
-    gemv(m, l.wq_b, m->q, m->qr, true);
-    stbl_rope(m->q, cs, c.heads, c.head_dim, c.rope, 0, m->st);
-    gemv(m, l.wkv, m->t0, x, true);
+    gemv(m, l.wkv, m->t0, x, true, l.wq_a.type == QT_STBL_E4M3);  // before wq_b, which requantizes m->xq
     float *kv = l.win_kv + (size_t)(pos % c.window) * c.head_dim;
     stbl_rms_norm(kv, m->t0, l.kv_norm, 1, c.head_dim, c.eps, m->st);
     stbl_rope(kv, cs, 1, c.head_dim, c.rope, 0, m->st);
     stbl_act_quant_fp8(kv, c.head_dim, m->st);
+    gemv(m, l.wq_b, m->q, m->qr, true);
+    stbl_rope(m->q, cs, c.heads, c.head_dim, c.rope, 0, m->st);
     std::vector<int> idx;
     for (int s = 0; s < c.window && s <= pos; s++) idx.push_back(s);
     const float *comp_kv = nullptr;
