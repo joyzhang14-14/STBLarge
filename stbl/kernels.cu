@@ -107,7 +107,9 @@ __global__ void k_gemv_fp8(float *y, const uint8_t *w, const uint8_t *scale, con
 
 // MXFP4 rows as GGUF blocks of 17 bytes: E8M0 scale, then 16 bytes holding values 0..15 in the low
 // nibbles and 16..31 in the high nibbles. One warp per row: the warp stages 32 blocks (544 bytes) at a
-// time in shared memory with 8-byte loads, then each lane sums one block. Needs k % 256 == 0 and w
+// time in shared memory with 8-byte loads, then each lane sums one block. The additions are those of
+// one warp per block (products added by the xor-butterfly tree, block sums added in block order), so
+// the result matches the validated one-warp-per-block kernel bit for bit. Needs k % 256 == 0 and w
 // 8-byte aligned, so that every row and every 32-block chunk starts 8-byte aligned. The value table
 // sits in shared memory: lanes index it with different codes, which constant memory would serialize.
 __global__ void k_gemv_mxfp4(float *y, const uint8_t *w, const float *x, int rows, int k) {
@@ -126,21 +128,29 @@ __global__ void k_gemv_mxfp4(float *y, const uint8_t *w, const float *x, int row
         const uint2 *src = (const uint2 *)(wr + (size_t)kb0 * 17);
         for (int i = lane; i < words; i += 32) stage[warp][i] = src[i];
         __syncwarp();
+        float bs = 0.f;
         if (lane < nb) {
             const uint8_t *blk = sb + lane * 17;
             const float4 *xv = (const float4 *)(x + (size_t)(kb0 + lane) * 32);
-            float s = 0.f;
+            float p[32];
+#pragma unroll
             for (int q = 0; q < 4; q++) {
                 const float4 lo = xv[q], hi = xv[q + 4];
                 const uint8_t b0 = blk[1 + q * 4], b1 = blk[2 + q * 4], b2 = blk[3 + q * 4], b3 = blk[4 + q * 4];
-                s += lo.x * fp4[b0 & 15] + lo.y * fp4[b1 & 15] + lo.z * fp4[b2 & 15] + lo.w * fp4[b3 & 15];
-                s += hi.x * fp4[b0 >> 4] + hi.y * fp4[b1 >> 4] + hi.z * fp4[b2 >> 4] + hi.w * fp4[b3 >> 4];
+                p[q * 4] = __fmul_rn(lo.x, fp4[b0 & 15]), p[q * 4 + 1] = __fmul_rn(lo.y, fp4[b1 & 15]);
+                p[q * 4 + 2] = __fmul_rn(lo.z, fp4[b2 & 15]), p[q * 4 + 3] = __fmul_rn(lo.w, fp4[b3 & 15]);
+                p[16 + q * 4] = __fmul_rn(hi.x, fp4[b0 >> 4]), p[17 + q * 4] = __fmul_rn(hi.y, fp4[b1 >> 4]);
+                p[18 + q * 4] = __fmul_rn(hi.z, fp4[b2 >> 4]), p[19 + q * 4] = __fmul_rn(hi.w, fp4[b3 >> 4]);
             }
-            acc += s * e8m0(blk[0]);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int i = 0; i < o; i++) p[i] = __fadd_rn(p[i], p[i + o]);
+            bs = p[0] * e8m0(blk[0]);  // exact: the scale is a power of two
         }
+        for (int b = 0; b < nb; b++) acc = __fadd_rn(acc, __shfl_sync(0xffffffffu, bs, b));
         __syncwarp();
     }
-    acc = warp_sum(acc);
     if (lane == 0) y[r] = bf16r(acc);
 }
 
@@ -205,25 +215,31 @@ __global__ void k_rope(float *x, const float *cos_sin, int heads, int width, int
 
 // Hyper-connection mixes: mixes[m] = (hc_fn[m] . x) * rsqrt(mean(x^2) + eps) over the flattened
 // hc*dim stream, then the official hc_split_sinkhorn. One block of 256 threads.
-// The mix dot products (and, as row `mix`, the sum of squares) in kHcSlices slices per row, one
-// 256-thread block per (slice, row); k_hc_mixes adds the slices in order. One partial buffer: the
-// engine runs one stream.
-constexpr int kHcSlices = 8;
-__device__ float g_hc_part[65 * kHcSlices];
+// The mix dot products, one block per row (its first warp: lane-strided sums, then the warp tree), and
+// as row `mix` the sum of squares (256 threads, warp sums added in order): the order of the validated
+// single-block kernel, spread over mix + 1 blocks. One result buffer: the engine runs one stream.
+__device__ float g_hc_part[65];
 
 __global__ void k_hc_dot(const float *x, const float *fn, int n, int mix) {
     __shared__ float part[8];
-    const int s = blockIdx.x, m = blockIdx.y, len = n / kHcSlices;
-    const float *w = m < mix ? fn + (size_t)m * n : x;
-    float a = 0.f;
-    for (int i = s * len + threadIdx.x; i < (s + 1) * len; i += blockDim.x) a += w[i] * x[i];
-    a = warp_sum(a);
-    if ((threadIdx.x & 31) == 0) part[threadIdx.x / 32] = a;
+    const int m = blockIdx.x, lane = threadIdx.x & 31;
+    if (m < mix) {
+        if (threadIdx.x >= 32) return;
+        float a = 0.f;
+        for (int i = lane; i < n; i += 32) a += fn[(size_t)m * n + i] * x[i];
+        a = warp_sum(a);
+        if (lane == 0) g_hc_part[m] = a;
+        return;
+    }
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += x[i] * x[i];
+    s = warp_sum(s);
+    if (lane == 0) part[threadIdx.x / 32] = s;
     __syncthreads();
     if (threadIdx.x == 0) {
         float t = 0.f;
-        for (int i = 0; i < (int)blockDim.x / 32; i++) t += part[i];
-        g_hc_part[m * kHcSlices + s] = t;
+        for (int w = 0; w < (int)blockDim.x / 32; w++) t += part[w];
+        g_hc_part[mix] = t;
     }
 }
 
@@ -231,11 +247,7 @@ __global__ void k_hc_mixes(float *pre, float *post, float *comb, const float *sc
                            int dim, int iters, float norm_eps, float hc_eps) {
     const int n = hc * dim, mix = (2 + hc) * hc;
     __shared__ float mixes[65];
-    if ((int)threadIdx.x <= mix) {  // thread m adds the slices of row m
-        float a = 0.f;
-        for (int s = 0; s < kHcSlices; s++) a += g_hc_part[threadIdx.x * kHcSlices + s];
-        mixes[threadIdx.x] = a;
-    }
+    if ((int)threadIdx.x <= mix) mixes[threadIdx.x] = g_hc_part[threadIdx.x];
     __syncthreads();
     // One warp from here: lane j * hc + k holds comb[j][k] and gathers its row or column by shuffles,
     // adding in index order like the serial loops of the reference.
@@ -481,8 +493,8 @@ void stbl_rope(float *x, const float *cos_sin, int heads, int width, int rope, i
 }
 void stbl_hc_mixes(float *pre, float *post, float *comb, const float *x, const float *fn, const float *scale,
                    const float *base, int hc, int dim, int iters, float norm_eps, float hc_eps, cudaStream_t st) {
-    const int n = hc * dim, mix = (2 + hc) * hc;  // n % kHcSlices == 0, mix <= 64
-    k_hc_dot<<<dim3(kHcSlices, mix + 1), 256, 0, st>>>(x, fn, n, mix);
+    const int n = hc * dim, mix = (2 + hc) * hc;  // mix <= 64
+    k_hc_dot<<<mix + 1, 256, 0, st>>>(x, fn, n, mix);
     k_hc_mixes<<<1, 96, 0, st>>>(pre, post, comb, scale, base, hc, dim, iters, norm_eps, hc_eps);
 }
 void stbl_hc_pre(float *out, const float *x, const float *pre, int hc, int dim, cudaStream_t st) {
