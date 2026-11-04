@@ -7,7 +7,8 @@
 // counts how many of its top M would have covered the next layer's expert misses (stbl_lookahead).
 // STBL_PREFETCH=M reads the uncached ones of that guess's top M into cache slots in the background, so
 // the next layer finds them, with STBL_PREFETCH_THREADS (default 4) readers; reads the current layer is
-// waiting for go first. Implies STBL_LOOKAHEAD >= M.
+// waiting for go first. Implies STBL_LOOKAHEAD >= M. STBL_PREFETCH2=M2 also reads the top M2 of the
+// layer after next (its router on this layer's FFN input), queued behind the next layer's.
 // STBL_READ_THREADS=N (default 4) reads the missing experts of a layer in 2 MiB pieces with N threads.
 // STBL_TIMING=1 syncs the stream at every section boundary and adds the wall time to per-section
 // totals (stbl_timing); it slows decoding down and serializes the expert reads with the GPU work they
@@ -144,7 +145,8 @@ struct stbl_model {
     uint64_t la[4] = {};
     // STBL_PREFETCH: jobs stay in pf_jobs until their layer consumes them or the slot is evicted; slots
     // come from next_slot (never used), free_slots (cancelled prefetches) or the LRU end
-    int prefetch = 0, next_slot = 0;
+    int prefetch = 0, prefetch2 = 0, next_slot = 0;
+    float *router3 = nullptr;
     std::vector<int> free_slots;
     std::unordered_map<uint64_t, std::shared_ptr<PfJob>> pf_jobs;
     std::deque<std::pair<std::shared_ptr<PfJob>, int>> pf_queue;  // (job, piece), best guesses first
@@ -424,12 +426,17 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     mark(m, T_ROUTER);
     stbl_gemv_f32(m->router, l.gate_w, x, c.experts, c.dim, 0, m->st);
     stbl_sqrt_softplus(m->router, c.experts, m->st);
-    const bool ahead = m->ahead > 0 && il + 1 < c.layers;
+    const bool ahead = m->ahead > 0 && il + 1 < c.layers, ahead2 = m->prefetch2 > 0 && il + 2 < c.layers;
     if (ahead) {
         stbl_gemv_f32(m->router2, m->L[il + 1].gate_w, x, c.experts, c.dim, 0, m->st);
         stbl_sqrt_softplus(m->router2, c.experts, m->st);
     }
+    if (ahead2) {
+        stbl_gemv_f32(m->router3, m->L[il + 2].gate_w, x, c.experts, c.dim, 0, m->st);
+        stbl_sqrt_softplus(m->router3, c.experts, m->st);
+    }
     const std::vector<float> sc = to_host(m, m->router, c.experts);
+    const std::vector<float> s3 = ahead2 ? to_host(m, m->router3, c.experts) : std::vector<float>();
     const std::vector<float> &bias = l.bias_h;
     std::vector<int> order(c.experts);
     std::iota(order.begin(), order.end(), 0);
@@ -526,20 +533,35 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
         while (jb->state.load() == 1) std::this_thread::yield();
         if (jb->state.load() == 4) read_pieces(m, jb->ps);
     }
-    if (m->prefetch > 0 && m->pred_layer == il + 1) {
-        std::lock_guard<std::mutex> lk(m->pf_mu);
-        for (int i = 0; i < std::min<int>(m->prefetch, (int)m->pred.size()); i++) {
-            const uint64_t key = (uint64_t)(il + 1) << 32 | (uint32_t)m->pred[i];
+    auto issue = [&](int layer, const std::vector<int> &guess, int n) {  // under pf_mu
+        for (int i = 0; i < std::min<int>(n, (int)guess.size()); i++) {
+            const uint64_t key = (uint64_t)layer << 32 | (uint32_t)guess[i];
             if (m->ec.where.count(key)) continue;
             auto jb = std::make_shared<PfJob>();
-            jb->layer = il + 1, jb->e = m->pred[i];
+            jb->layer = layer, jb->e = guess[i];
             const int slot = take_slot(m);
-            expert_pieces(m, il + 1, jb->e, m->ec.mem + (uint64_t)slot * m->ec.slot_bytes, jb->ps);
+            expert_pieces(m, layer, jb->e, m->ec.mem + (uint64_t)slot * m->ec.slot_bytes, jb->ps);
             m->ec.lru.push_front(key);
             m->ec.where[key] = {slot, m->ec.lru.begin()};
             m->pf_jobs[key] = jb;
             for (int pc = 0; pc < (int)jb->ps.size(); pc++) m->pf_queue.emplace_back(jb, pc);
             m->pf[0]++;
+        }
+    };
+    if (m->prefetch > 0 && m->pred_layer == il + 1) {
+        std::lock_guard<std::mutex> lk(m->pf_mu);
+        issue(il + 1, m->pred, m->prefetch);
+        if (ahead2) {
+            const std::vector<float> &b3 = m->L[il + 2].bias_h;
+            std::vector<int> o3(c.experts);
+            std::iota(o3.begin(), o3.end(), 0);
+            const int k3 = std::min(m->prefetch2, c.experts);
+            std::partial_sort(o3.begin(), o3.begin() + k3, o3.end(), [&](int a, int b) {
+                const float va = s3[a] + b3[a], vb = s3[b] + b3[b];
+                return va > vb || (va == vb && a < b);
+            });
+            o3.resize(k3);
+            issue(il + 2, o3, k3);
         }
         m->pf_cv.notify_all();
     }
@@ -963,9 +985,12 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->moe_mid = dalloc(c.inter); m->moe_out = dalloc(c.dim); m->moe_y = dalloc(c.dim);
     m->moe_eo = dalloc((size_t)c.topk * c.dim);
     m->router2 = dalloc(c.experts);
+    m->router3 = dalloc(c.experts);
     const char *ahead = getenv("STBL_LOOKAHEAD"), *pf = getenv("STBL_PREFETCH");
     m->ahead = ahead && ahead[0] ? atoi(ahead) : 0;
     m->prefetch = pf && pf[0] ? atoi(pf) : 0;
+    const char *pf2 = getenv("STBL_PREFETCH2");
+    m->prefetch2 = m->prefetch > 0 && pf2 && pf2[0] ? atoi(pf2) : 0;
     m->ahead = std::max(m->ahead, m->prefetch);
     const char *pt = getenv("STBL_PREFETCH_THREADS");
     const int pf_readers = m->prefetch > 0 ? std::max(1, std::min(pt && pt[0] ? atoi(pt) : 4, 16)) : 0;
