@@ -5,6 +5,8 @@
 // STBL_DUMP_ROUTES=FILE appends the routed expert ids (int32, top-k order) of every layer.
 // STBL_LOOKAHEAD=M scores the next layer's router on this layer's FFN input (the stale-router guess) and
 // counts how many of its top M would have covered the next layer's expert misses (stbl_lookahead).
+// STBL_PREFETCH=M reads the uncached ones of that guess's top M into cache slots in the background, so
+// the next layer finds them; reads the current layer is waiting for go first. Implies STBL_LOOKAHEAD >= M.
 // STBL_READ_THREADS=N (default 4) reads the missing experts of a layer in 2 MiB pieces with N threads.
 // STBL_TIMING=1 syncs the stream at every section boundary and adds the wall time to per-section
 // totals (stbl_timing); it slows decoding down and serializes the expert reads with the GPU work they
@@ -20,8 +22,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <future>
 #include <list>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -73,6 +79,18 @@ struct Layer {
 
 enum TimeCat { T_HC, T_ENGRAM, T_ATTN, T_ROUTER, T_READ, T_EXPERT, T_SHARED, T_HEAD, T_N };
 
+struct Piece {
+    uint8_t *dst;
+    uint64_t off, bytes;
+};
+
+// STBL_PREFETCH: a background read of a guessed expert into its cache slot.
+struct PfJob {
+    int layer, e;
+    std::vector<Piece> ps;
+    std::atomic<int> state{0};  // 0 queued, 1 reading, 2 landed, 3 cancelled, 4 failed
+};
+
 struct ExpertCache {
     int slots = 0;
     uint64_t slot_bytes = 0;
@@ -120,6 +138,18 @@ struct stbl_model {
     std::vector<int> pred;
     std::vector<char> pred_cold;
     uint64_t la[4] = {};
+    // STBL_PREFETCH: jobs stay in pf_jobs until their layer consumes them or the slot is evicted; slots
+    // come from next_slot (never used), free_slots (cancelled prefetches) or the LRU end
+    int prefetch = 0, next_slot = 0;
+    std::vector<int> free_slots;
+    std::unordered_map<uint64_t, std::shared_ptr<PfJob>> pf_jobs;
+    std::deque<std::shared_ptr<PfJob>> pf_queue;
+    std::mutex pf_mu;
+    std::condition_variable pf_cv;
+    bool pf_stop = false;
+    std::vector<std::thread> pf_threads;
+    std::atomic<int> demand{0};  // demand reads in flight; prefetch readers wait while it is non-zero
+    uint64_t pf[4] = {};         // issued, routed and landed, routed and still reading, cancelled
     std::vector<char> candidates;
     FILE *dump = nullptr, *dump_routes = nullptr;
     // STBL_TIMING
@@ -229,11 +259,6 @@ std::vector<float> to_host(stbl_model *m, const float *d, int n) {
 
 constexpr uint64_t kPiece = 2 << 20, kAlign = 4096;
 
-struct Piece {
-    uint8_t *dst;
-    uint64_t off, bytes;
-};
-
 // Reads `bytes` at file offset `off` into `stage` (kPiece + 2 * kAlign bytes); returns where the data starts.
 const uint8_t *read_range(stbl_model *m, uint8_t *stage, uint64_t off, uint64_t bytes) {
     const int fd = m->dfd >= 0 ? m->dfd : m->f.fd;
@@ -250,6 +275,11 @@ const uint8_t *read_range(stbl_model *m, uint8_t *stage, uint64_t off, uint64_t 
 
 // Reads the pieces into device memory with all reader threads; returns once every copy has landed.
 void read_pieces(stbl_model *m, const std::vector<Piece> &ps) {
+    struct Demand {
+        std::atomic<int> &n;
+        explicit Demand(std::atomic<int> &c) : n(c) { n++; }
+        ~Demand() { n--; }
+    } demand(m->demand);
     std::atomic<size_t> next{0};
     std::atomic<bool> ok{true};
     auto work = [&](int w) {
@@ -268,37 +298,116 @@ void read_pieces(stbl_model *m, const std::vector<Piece> &ps) {
     if (!ok) throw std::runtime_error("expert read failed");
 }
 
-// Cache slot of expert e of a layer. A miss takes a free or the least recently used slot and appends
-// the expert's bytes to `ps`; the caller reads them before the slot is used.
-const uint8_t *expert(stbl_model *m, int layer, int e, std::vector<Piece> &ps) {
+// Reads queued prefetch jobs with its own pinned stage and copy stream, one 2 MiB piece at a time,
+// waiting before each piece while a demand read is in flight.
+void prefetch_worker(stbl_model *m) {
+    uint8_t *stage = nullptr;
+    cudaStream_t st = nullptr;
+    if (cudaMallocHost(&stage, kPiece + 2 * kAlign) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) != cudaSuccess)
+        return;  // queued jobs stay at 0 and are read on demand
+    for (;;) {
+        std::shared_ptr<PfJob> job;
+        {
+            std::unique_lock<std::mutex> lk(m->pf_mu);
+            m->pf_cv.wait(lk, [&] { return m->pf_stop || !m->pf_queue.empty(); });
+            if (m->pf_stop) break;
+            job = m->pf_queue.front();
+            m->pf_queue.pop_front();
+        }
+        int expect = 0;
+        if (!job->state.compare_exchange_strong(expect, 1)) continue;  // cancelled or taken on demand
+        bool ok = true;
+        for (const Piece &pc : job->ps) {
+            while (m->demand.load() > 0) std::this_thread::yield();
+            const uint8_t *src = read_range(m, stage, pc.off, pc.bytes);
+            if (!src || cudaMemcpyAsync(pc.dst, src, pc.bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+                cudaStreamSynchronize(st) != cudaSuccess) {
+                ok = false;
+                break;
+            }
+        }
+        job->state = ok ? 2 : 4;
+    }
+    cudaFreeHost(stage);
+    cudaStreamDestroy(st);
+}
+
+// A slot to fill: never used, freed by a cancelled prefetch, or the least recently used one that no
+// prefetch is still reading into.
+int take_slot(stbl_model *m) {
     ExpertCache &ec = m->ec;
-    const uint64_t key = (uint64_t)layer << 32 | (uint32_t)e;
-    auto it = ec.where.find(key);
-    if (it != ec.where.end()) {
-        ec.lru.splice(ec.lru.begin(), ec.lru, it->second.second);
-        ec.hits++;
-        return ec.mem + (uint64_t)it->second.first * ec.slot_bytes;
+    if (!m->free_slots.empty()) {
+        const int s = m->free_slots.back();
+        m->free_slots.pop_back();
+        return s;
     }
-    ec.misses++;
-    int slot;
-    if ((int)ec.where.size() < ec.slots) {
-        slot = (int)ec.where.size();
-    } else {
-        const uint64_t old = ec.lru.back();
-        slot = ec.where[old].first;
-        ec.where.erase(old);
-        ec.lru.pop_back();
+    if (m->next_slot < ec.slots) return m->next_slot++;
+    for (auto it = ec.lru.end(); it != ec.lru.begin();) {
+        --it;
+        const uint64_t key = *it;
+        auto job = m->pf_jobs.find(key);
+        if (job != m->pf_jobs.end()) {
+            if (job->second->state.load() < 2) continue;
+            m->pf_jobs.erase(job);
+        }
+        const int s = ec.where[key].first;
+        ec.where.erase(key);
+        ec.lru.erase(it);
+        return s;
     }
+    throw std::runtime_error("every expert cache slot is being read into");
+}
+
+// Appends the bytes of expert e of a layer (gate, up, down) to `ps`, landing at dst.
+void expert_pieces(const stbl_model *m, int layer, int e, uint8_t *dst, std::vector<Piece> &ps) {
     const Layer &l = m->L[layer];
-    uint8_t *dst = ec.mem + (uint64_t)slot * ec.slot_bytes;
     for (uint64_t p = 0, at = 0; p < 3; at += l.exp_bytes[p++]) {
         const uint64_t file_off = (uint64_t)(l.exp_w[p] - m->f.map) + (uint64_t)e * l.exp_bytes[p];
         for (uint64_t i = 0; i < l.exp_bytes[p]; i += kPiece)
             ps.push_back({dst + at + i, file_off + i, std::min(kPiece, l.exp_bytes[p] - i)});
     }
+}
+
+// Cache slot of expert e of a layer, in *ptr. Returns 0 when its bytes are there; 1 when they were
+// appended to `ps` (the caller reads them before the slot is used); 2 when a prefetch is still reading
+// them (the caller waits for *job, and reads job->ps itself if that read failed).
+int expert(stbl_model *m, int layer, int e, std::vector<Piece> &ps, const uint8_t **ptr, std::shared_ptr<PfJob> *job) {
+    ExpertCache &ec = m->ec;
+    const uint64_t key = (uint64_t)layer << 32 | (uint32_t)e;
+    auto it = ec.where.find(key);
+    if (it != ec.where.end()) {
+        ec.lru.splice(ec.lru.begin(), ec.lru, it->second.second);
+        *ptr = ec.mem + (uint64_t)it->second.first * ec.slot_bytes;
+        auto jt = m->pf_jobs.find(key);
+        if (jt == m->pf_jobs.end()) {
+            ec.hits++;
+            return 0;
+        }
+        std::shared_ptr<PfJob> jb = jt->second;
+        m->pf_jobs.erase(jt);
+        int state = 0;
+        if (jb->state.compare_exchange_strong(state, 1) || state == 4) {  // not started, or failed
+            ps.insert(ps.end(), jb->ps.begin(), jb->ps.end());
+            ec.misses++;
+            return 1;
+        }
+        ec.hits++;
+        if (state == 2) {
+            m->pf[1]++;
+            return 0;
+        }
+        m->pf[2]++;
+        *job = jb;
+        return 2;
+    }
+    ec.misses++;
+    uint8_t *dst = ec.mem + (uint64_t)take_slot(m) * ec.slot_bytes;
+    expert_pieces(m, layer, e, dst, ps);
     ec.lru.push_front(key);
-    ec.where[key] = {slot, ec.lru.begin()};
-    return dst;
+    ec.where[key] = {(int)((dst - ec.mem) / ec.slot_bytes), ec.lru.begin()};
+    *ptr = dst;
+    return 1;
 }
 
 // ---- MoE ------------------------------------------------------------------------------------------
@@ -350,6 +459,25 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     }
     if (m->dump_routes)
         for (int i = 0; i < c.topk; i++) fwrite(&order[i], 4, 1, m->dump_routes);
+    if (m->prefetch > 0) {  // this layer's unrouted guesses: cancel the ones not started; forget landed older ones
+        auto routed = [&](int e) { return std::find(order.begin(), order.begin() + c.topk, e) != order.begin() + c.topk; };
+        for (auto it = m->pf_jobs.begin(); it != m->pf_jobs.end();) {
+            PfJob &jb = *it->second;
+            int state = 0;
+            if (jb.layer == il && !routed(jb.e) && jb.state.compare_exchange_strong(state, 3)) {
+                auto w = m->ec.where.find(it->first);
+                m->free_slots.push_back(w->second.first);
+                m->ec.lru.erase(w->second.second);
+                m->ec.where.erase(w);
+                m->pf[3]++;
+                it = m->pf_jobs.erase(it);
+            } else if (jb.layer < il && jb.state.load() == 2) {
+                it = m->pf_jobs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     // m->st is idle here (to_host synced it), so evicted slots are no longer read by earlier kernels.
     // Cached experts of this layer are touched first so that a miss cannot evict one of them.
     for (int i = 0; i < c.topk; i++) {
@@ -359,11 +487,8 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     std::vector<Piece> ps;
     std::vector<const uint8_t *> ew(c.topk);
     std::vector<char> missing(c.topk);
-    for (int i = 0; i < c.topk; i++) {
-        const size_t before = ps.size();
-        ew[i] = expert(m, il, order[i], ps);
-        missing[i] = ps.size() > before;
-    }
+    std::vector<std::shared_ptr<PfJob>> pending(c.topk);
+    for (int i = 0; i < c.topk; i++) missing[i] = expert(m, il, order[i], ps, &ew[i], &pending[i]) != 0;
     CK(cudaMemsetAsync(m->moe_y, 0, (size_t)c.dim * 4, m->st));
     CK(cudaMemcpyAsync(m->moe_xq, x, (size_t)c.dim * 4, cudaMemcpyDeviceToDevice, m->st));
     stbl_act_quant_fp8(m->moe_xq, c.dim, m->st);
@@ -390,6 +515,28 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     gemv(m, l.sh_w2, m->moe_out, m->moe_mid, true);
     mark(m, T_READ);
     read_pieces(m, ps);  // the GPU runs the kernels queued above meanwhile
+    for (auto &jb : pending) {
+        if (!jb) continue;
+        while (jb->state.load() == 1) std::this_thread::yield();
+        if (jb->state.load() == 4) read_pieces(m, jb->ps);
+    }
+    if (m->prefetch > 0 && m->pred_layer == il + 1) {
+        std::lock_guard<std::mutex> lk(m->pf_mu);
+        for (int i = 0; i < std::min<int>(m->prefetch, (int)m->pred.size()); i++) {
+            const uint64_t key = (uint64_t)(il + 1) << 32 | (uint32_t)m->pred[i];
+            if (m->ec.where.count(key)) continue;
+            auto jb = std::make_shared<PfJob>();
+            jb->layer = il + 1, jb->e = m->pred[i];
+            const int slot = take_slot(m);
+            expert_pieces(m, il + 1, jb->e, m->ec.mem + (uint64_t)slot * m->ec.slot_bytes, jb->ps);
+            m->ec.lru.push_front(key);
+            m->ec.where[key] = {slot, m->ec.lru.begin()};
+            m->pf_jobs[key] = jb;
+            m->pf_queue.push_back(jb);
+            m->pf[0]++;
+        }
+        m->pf_cv.notify_all();
+    }
     mark(m, T_EXPERT);
     for (int i = 0; i < c.topk; i++) {
         if (missing[i]) run_expert(i);
@@ -810,8 +957,11 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->moe_mid = dalloc(c.inter); m->moe_out = dalloc(c.dim); m->moe_y = dalloc(c.dim);
     m->moe_eo = dalloc((size_t)c.topk * c.dim);
     m->router2 = dalloc(c.experts);
-    const char *ahead = getenv("STBL_LOOKAHEAD");
+    const char *ahead = getenv("STBL_LOOKAHEAD"), *pf = getenv("STBL_PREFETCH");
     m->ahead = ahead && ahead[0] ? atoi(ahead) : 0;
+    m->prefetch = pf && pf[0] ? atoi(pf) : 0;
+    m->ahead = std::max(m->ahead, m->prefetch);
+    for (int t = 0; t < (m->prefetch > 0 ? 4 : 0); t++) m->pf_threads.emplace_back(prefetch_worker, m);
     m->eng_vals = dalloc(64 * 256); m->eng_kv = dalloc((size_t)(c.hc + 1) * c.dim);
     m->logits = dalloc(c.vocab);
     CK(cudaMalloc(&m->attn_idx, (size_t)(c.window + c.index_topk + 8) * sizeof(int)));
@@ -899,6 +1049,10 @@ int stbl_timing(const stbl_model *m, double *sec, int n) {
 int stbl_vocab(const stbl_model *m) { return m->c.vocab; }
 const char *stbl_error(const stbl_model *m) { return m->err.c_str(); }
 
+void stbl_prefetch(const stbl_model *m, uint64_t *out) {
+    for (int i = 0; i < 4; i++) out[i] = m->pf[i];
+}
+
 void stbl_lookahead(const stbl_model *m, uint64_t *out) {
     for (int i = 0; i < 4; i++) out[i] = m->la[i];
 }
@@ -911,6 +1065,14 @@ void stbl_stats(const stbl_model *m, uint64_t *hits, uint64_t *misses) {
 void stbl_close(stbl_model *m) {
     if (m && m->dump) fclose(m->dump);
     if (m && m->dump_routes) fclose(m->dump_routes);
+    if (m) {
+        {
+            std::lock_guard<std::mutex> lk(m->pf_mu);
+            m->pf_stop = true;
+        }
+        m->pf_cv.notify_all();
+        for (auto &t : m->pf_threads) t.join();
+    }
     if (m && m->dfd >= 0) close(m->dfd);
     delete m;  // device memory is released with the process
 }
