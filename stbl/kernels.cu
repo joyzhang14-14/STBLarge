@@ -314,67 +314,97 @@ __global__ void k_hc_post(float *out, const float *x, const float *res, const fl
 // Sparse decode attention: q [heads][d]; idx picks rows (-1 = none) from the window cache kv1 (idx < n1)
 // or the compressed cache kv2 (row idx - n1); sink per head.
 // Probabilities are rounded to bf16 before the value product, output rounded to bf16. One block per head.
-// One head per blockIdx.x, its 256 output dims [blockIdx.y * 256, +256) per block (each block
-// recomputes the head's scores). The arithmetic is that of the one-block-per-head kernel: lane-strided
-// dot products added by the warp tree, the exp sum added in index order, and each output dim
-// accumulated over the picks in order; the picks are loaded eight at a time ahead of the additions.
-__global__ void k_sparse_attn(float *out, const float *q, const float *kv1, int n1, const float *kv2,
-                              const int *idx, int n_idx, const float *sink, int d, float scale) {
-    extern __shared__ float sm[];
-    float *qs = sm, *sc = sm + d, *pr = sc + n_idx;  // sc: scores, then exps; pr: bf16(exp)
-    int *ids = (int *)(pr + n_idx);
-    const int h = blockIdx.x;
-    for (int i = threadIdx.x; i < d; i += blockDim.x) qs[i] = q[(size_t)h * d + i];
-    for (int t = threadIdx.x; t < n_idx; t += blockDim.x) ids[t] = idx[t];
+// Sparse attention in two launches with the arithmetic of the one-block-per-head kernel: k_attn_scores
+// computes every (head, pick) dot product by one warp (lane-strided products added by the warp tree) into
+// g_attn_sc; k_attn_out takes kAttnHeads heads and 256 output dims per block, adds the exps in index order and
+// accumulates each output dim over the picks in order, loading 32 picks ahead of the additions.
+constexpr int kAttnMax = 64 * 1024;  // heads x picks
+constexpr int kAttnHeads = 4;  // heads per k_attn_out block: each kv value loaded serves them all
+__device__ float g_attn_sc[kAttnMax];
+
+// kScoreHeads heads x 16 picks per block, one pick per warp at a time: the kv row is loaded once and
+// dotted with each head's q (staged in shared memory), each dot added as the reference does.
+constexpr int kScoreHeads = 8;
+
+__global__ void k_attn_scores(const float *q, const float *kv1, int n1, const float *kv2, const int *idx, int n_idx,
+                              int d, float scale) {
+    extern __shared__ float qs[];  // [kScoreHeads][d]
+    const int h0 = blockIdx.x * kScoreHeads, lane = threadIdx.x & 31;
+    for (int i = threadIdx.x; i < kScoreHeads * d; i += blockDim.x) qs[i] = q[(size_t)h0 * d + i];
     __syncthreads();
-    const int warps = blockDim.x / 32, lane = threadIdx.x & 31;
-    for (int t = threadIdx.x / 32; t < n_idx; t += warps) {
-        const int r = ids[t];
+    const int t_end = min(n_idx, (int)(blockIdx.y + 1) * 16);
+    for (int t = blockIdx.y * 16 + threadIdx.x / 32; t < t_end; t += blockDim.x / 32) {
+        const int r = idx[t];
         const float *row = r < n1 ? kv1 + (size_t)r * d : kv2 + (size_t)(r - n1) * d;
-        float a = 0.f;
+        float v[16];  // d <= 512
         if (r >= 0)
-            for (int i = lane; i < d; i += 32) a += qs[i] * row[i];
-        a = warp_sum(a);
-        if (lane == 0) sc[t] = r >= 0 ? a * scale : -INFINITY;
+#pragma unroll
+            for (int c = 0; c < 16; c++) v[c] = lane + c * 32 < d ? row[lane + c * 32] : 0.f;
+        for (int hh = 0; hh < kScoreHeads; hh++) {
+            float a = 0.f;
+            if (r >= 0)
+#pragma unroll
+                for (int c = 0; c < 16; c++)
+                    if (lane + c * 32 < d) a += qs[hh * d + lane + c * 32] * v[c];
+            a = warp_sum(a);
+            if (lane == 0) g_attn_sc[(size_t)(h0 + hh) * n_idx + t] = r >= 0 ? a * scale : -INFINITY;
+        }
     }
+}
+
+__global__ void k_attn_out(float *out, const float *kv1, int n1, const float *kv2, const int *idx, int n_idx,
+                           const float *sink, int d) {
+    extern __shared__ float sm[];
+    float *sc = sm, *pr = sc + kAttnHeads * n_idx;  // [head][pick]: exps, bf16(exp)
+    int *ids = (int *)(pr + kAttnHeads * n_idx);
+    __shared__ float red[kAttnHeads][2];
+    const int h0 = blockIdx.x * kAttnHeads;
+    for (int t = threadIdx.x; t < n_idx; t += blockDim.x) ids[t] = idx[t];
+    for (int t = threadIdx.x; t < kAttnHeads * n_idx; t += blockDim.x) sc[t] = g_attn_sc[(size_t)h0 * n_idx + t];
     __syncthreads();
-    __shared__ float red[2];
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < kAttnHeads) {
+        const float *s = sc + threadIdx.x * n_idx;
         float mx = -1e30f;
-        for (int t = 0; t < n_idx; t++) mx = fmaxf(mx, sc[t]);
-        red[1] = mx;
+        for (int t = 0; t < n_idx; t++) mx = fmaxf(mx, s[t]);
+        red[threadIdx.x][1] = mx;
     }
     __syncthreads();
-    const float mx = red[1];
-    for (int t = threadIdx.x; t < n_idx; t += blockDim.x) sc[t] = expf(sc[t] - mx);
+    for (int t = threadIdx.x; t < kAttnHeads * n_idx; t += blockDim.x) sc[t] = expf(sc[t] - red[t / n_idx][1]);
     __syncthreads();
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < kAttnHeads) {
+        const float *s = sc + threadIdx.x * n_idx;
         float sum = 0.f;
-        for (int t = 0; t < n_idx; t++) sum += sc[t];
-        red[0] = sum + expf(sink[h] - mx);
+        for (int t = 0; t < n_idx; t++) sum += s[t];
+        red[threadIdx.x][0] = sum + expf(sink[h0 + threadIdx.x] - red[threadIdx.x][1]);
     }
-    for (int t = threadIdx.x; t < n_idx; t += blockDim.x) pr[t] = bf16r(sc[t]);
+    for (int t = threadIdx.x; t < kAttnHeads * n_idx; t += blockDim.x) pr[t] = bf16r(sc[t]);
     __syncthreads();
     const int i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= d) return;
-    float a = 0.f;
+    float a[kAttnHeads] = {};
     int t = 0;
-    for (; t + 8 <= n_idx; t += 8) {
-        float v[8];
+    for (; t + 32 <= n_idx; t += 32) {
+        float v[32];
 #pragma unroll
-        for (int u = 0; u < 8; u++) {
+        for (int u = 0; u < 32; u++) {
             const int r = ids[t + u];
             v[u] = r < 0 ? 0.f : (r < n1 ? kv1[(size_t)r * d + i] : kv2[(size_t)(r - n1) * d + i]);
         }
 #pragma unroll
-        for (int u = 0; u < 8; u++)
-            if (ids[t + u] >= 0) a += pr[t + u] * v[u];
+        for (int u = 0; u < 32; u++)
+            if (ids[t + u] >= 0)
+#pragma unroll
+                for (int hh = 0; hh < kAttnHeads; hh++) a[hh] += pr[hh * n_idx + t + u] * v[u];
     }
     for (; t < n_idx; t++) {
         const int r = ids[t];
-        if (r >= 0) a += pr[t] * (r < n1 ? kv1[(size_t)r * d + i] : kv2[(size_t)(r - n1) * d + i]);
+        if (r < 0) continue;
+        const float v = r < n1 ? kv1[(size_t)r * d + i] : kv2[(size_t)(r - n1) * d + i];
+#pragma unroll
+        for (int hh = 0; hh < kAttnHeads; hh++) a[hh] += pr[hh * n_idx + t] * v;
     }
-    out[(size_t)h * d + i] = bf16r(a / red[0]);
+#pragma unroll
+    for (int hh = 0; hh < kAttnHeads; hh++) out[(size_t)(h0 + hh) * d + i] = bf16r(a[hh] / red[hh][0]);
 }
 
 // Router scores: s = sqrt(softplus(logit)) (softplus threshold 20 as torch).
@@ -556,8 +586,13 @@ void stbl_hc_post(float *out, const float *x, const float *res, const float *pos
 }
 void stbl_sparse_attn(float *out, const float *q, const float *kv1, int n1, const float *kv2, const int *idx,
                       int n_idx, const float *sink, int heads, int d, float scale, cudaStream_t st) {
-    k_sparse_attn<<<dim3(heads, GRID(d, 256)), 256, (size_t)(d + 3 * n_idx) * sizeof(float), st>>>(
-        out, q, kv1, n1, kv2, idx, n_idx, sink, d, scale);
+    // heads * n_idx <= kAttnMax (64 heads, at most window + index_topk + 8 picks)
+    // heads % kScoreHeads == 0, d <= 512
+    k_attn_scores<<<dim3(heads / kScoreHeads, GRID(n_idx, 16)), 256, (size_t)kScoreHeads * d * sizeof(float), st>>>(
+        q, kv1, n1, kv2, idx, n_idx, d, scale);
+    // heads % kAttnHeads == 0
+    k_attn_out<<<dim3(heads / kAttnHeads, GRID(d, 256)), 256, (size_t)(2 * kAttnHeads + 1) * n_idx * sizeof(float), st>>>(
+        out, kv1, n1, kv2, idx, n_idx, sink, d);
 }
 void stbl_sqrt_softplus(float *s, int n, cudaStream_t st) { k_sqrt_softplus<<<GRID(n, 256), 256, 0, st>>>(s, n); }
 void stbl_swiglu(float *out, const float *g, const float *u, float weight, float limit, int n, cudaStream_t st) {
