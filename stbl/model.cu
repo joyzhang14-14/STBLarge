@@ -678,6 +678,21 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
         }
         l.win_kv = dalloc((size_t)c.window * c.head_dim);
     }
+    if (slots <= 0) {
+        // MemAvailable less 12 GiB of headroom; on GB10 cudaMemGetInfo counts only MemFree, which leaves
+        // out the page cache Linux can give back
+        uint64_t avail_kb = 0;
+        if (FILE *mi = fopen("/proc/meminfo", "r")) {
+            char line[128];
+            while (fgets(line, sizeof line, mi))
+                if (sscanf(line, "MemAvailable: %lu kB", &avail_kb) == 1) break;
+            fclose(mi);
+        }
+        const int64_t room = (int64_t)(avail_kb << 10) - (12LL << 30);
+        slots = (int)std::max<int64_t>(0, room / (int64_t)expert_bytes);
+        if (slots < c.topk) throw std::runtime_error("not enough memory for the expert cache");
+        fprintf(stderr, "stbl: expert cache %d slots (%.1f GiB)\n", slots, slots * (double)expert_bytes / (1 << 30));
+    }
     m->ec.slots = slots;
     m->ec.slot_bytes = expert_bytes;
     CK(cudaMalloc(&m->ec.mem, (size_t)slots * expert_bytes));

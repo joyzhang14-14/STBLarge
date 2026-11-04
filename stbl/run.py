@@ -24,7 +24,7 @@ def main():
     ap.add_argument("--system", default="")
     ap.add_argument("--tokens", type=int, default=32)
     ap.add_argument("--ctx", type=int, default=4096)
-    ap.add_argument("--experts", type=int, default=2000)
+    ap.add_argument("--experts", type=int, default=0)  # 0: sized from free memory
     a = ap.parse_args()
 
     sys.path.insert(0, os.path.join(CKPT, "encoding"))

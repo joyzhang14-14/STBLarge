@@ -8,7 +8,8 @@ extern "C" {
 
 typedef struct stbl_model stbl_model;
 
-// Open the STBLarge GGUF; ctx is the maximum sequence length, expert_slots the GPU expert cache size.
+// Open the STBLarge GGUF; ctx is the maximum sequence length, expert_slots the GPU expert cache size
+// (<= 0: as many as fit in MemAvailable less 12 GiB).
 // Returns NULL and fills err on failure.
 stbl_model *stbl_open(const char *path, int ctx, int expert_slots, char *err, int errlen);
 // Run one token at the next position. Writes fp32 logits when logits != NULL; returns the argmax
