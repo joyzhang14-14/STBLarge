@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -84,11 +85,13 @@ struct Piece {
     uint64_t off, bytes;
 };
 
-// STBL_PREFETCH: a background read of a guessed expert into its cache slot.
+// STBL_PREFETCH: a background read of a guessed expert into its cache slot. Its pieces are spread over
+// all prefetch readers, so one expert lands as fast as a demand read would.
 struct PfJob {
     int layer, e;
     std::vector<Piece> ps;
-    std::atomic<int> state{0};  // 0 queued, 1 reading, 2 landed, 3 cancelled, 4 failed
+    std::atomic<int> state{0};  // 0 queued, 1 reading, 2 landed, 3 cancelled, 4 failed, 5 taken on demand
+    std::atomic<int> done{0};   // pieces landed
 };
 
 struct ExpertCache {
@@ -143,7 +146,7 @@ struct stbl_model {
     int prefetch = 0, next_slot = 0;
     std::vector<int> free_slots;
     std::unordered_map<uint64_t, std::shared_ptr<PfJob>> pf_jobs;
-    std::deque<std::shared_ptr<PfJob>> pf_queue;
+    std::deque<std::pair<std::shared_ptr<PfJob>, int>> pf_queue;  // (job, piece), best guesses first
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     bool pf_stop = false;
@@ -298,8 +301,8 @@ void read_pieces(stbl_model *m, const std::vector<Piece> &ps) {
     if (!ok) throw std::runtime_error("expert read failed");
 }
 
-// Reads queued prefetch jobs with its own pinned stage and copy stream, one 2 MiB piece at a time,
-// waiting before each piece while a demand read is in flight.
+// Reads queued prefetch pieces with its own pinned stage and copy stream, waiting before each piece
+// while a demand read is in flight.
 void prefetch_worker(stbl_model *m) {
     uint8_t *stage = nullptr;
     cudaStream_t st = nullptr;
@@ -308,26 +311,28 @@ void prefetch_worker(stbl_model *m) {
         return;  // queued jobs stay at 0 and are read on demand
     for (;;) {
         std::shared_ptr<PfJob> job;
+        int piece;
         {
             std::unique_lock<std::mutex> lk(m->pf_mu);
             m->pf_cv.wait(lk, [&] { return m->pf_stop || !m->pf_queue.empty(); });
             if (m->pf_stop) break;
-            job = m->pf_queue.front();
+            std::tie(job, piece) = m->pf_queue.front();
             m->pf_queue.pop_front();
         }
-        int expect = 0;
-        if (!job->state.compare_exchange_strong(expect, 1)) continue;  // cancelled or taken on demand
-        bool ok = true;
-        for (const Piece &pc : job->ps) {
-            while (m->demand.load() > 0) std::this_thread::yield();
-            const uint8_t *src = read_range(m, stage, pc.off, pc.bytes);
-            if (!src || cudaMemcpyAsync(pc.dst, src, pc.bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
-                cudaStreamSynchronize(st) != cudaSuccess) {
-                ok = false;
-                break;
-            }
+        while (m->demand.load() > 0) std::this_thread::yield();
+        int state = 0;
+        if (!job->state.compare_exchange_strong(state, 1) && state != 1) continue;  // cancelled, failed or taken
+        const Piece &pc = job->ps[piece];
+        const uint8_t *src = read_range(m, stage, pc.off, pc.bytes);
+        if (!src || cudaMemcpyAsync(pc.dst, src, pc.bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+            cudaStreamSynchronize(st) != cudaSuccess) {
+            job->state = 4;
+            continue;
         }
-        job->state = ok ? 2 : 4;
+        if (++job->done == (int)job->ps.size()) {
+            state = 1;
+            job->state.compare_exchange_strong(state, 2);
+        }
     }
     cudaFreeHost(stage);
     cudaStreamDestroy(st);
@@ -387,7 +392,7 @@ int expert(stbl_model *m, int layer, int e, std::vector<Piece> &ps, const uint8_
         std::shared_ptr<PfJob> jb = jt->second;
         m->pf_jobs.erase(jt);
         int state = 0;
-        if (jb->state.compare_exchange_strong(state, 1) || state == 4) {  // not started, or failed
+        if (jb->state.compare_exchange_strong(state, 5) || state == 4) {  // not started, or failed
             ps.insert(ps.end(), jb->ps.begin(), jb->ps.end());
             ec.misses++;
             return 1;
@@ -532,7 +537,7 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
             m->ec.lru.push_front(key);
             m->ec.where[key] = {slot, m->ec.lru.begin()};
             m->pf_jobs[key] = jb;
-            m->pf_queue.push_back(jb);
+            for (int pc = 0; pc < (int)jb->ps.size(); pc++) m->pf_queue.emplace_back(jb, pc);
             m->pf[0]++;
         }
         m->pf_cv.notify_all();
