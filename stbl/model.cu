@@ -5,8 +5,8 @@
 // STBL_DUMP_ROUTES=FILE appends the routed expert ids (int32, top-k order) of every layer.
 // STBL_LOOKAHEAD=M scores the next layer's router on this layer's FFN input (the stale-router guess) and
 // counts how many of its top M would have covered the next layer's expert misses (stbl_lookahead).
-// STBL_PREFETCH=M reads the uncached ones of that guess's top M into cache slots in the background, so
-// the next layer finds them, with STBL_PREFETCH_THREADS (default 4) readers; reads the current layer is
+// STBL_PREFETCH=M (default 8, 0: off) reads the uncached ones of that guess's top M into cache slots in the background, so
+// the next layer finds them, with STBL_PREFETCH_THREADS (default 8) readers; reads the current layer is
 // waiting for go first. Implies STBL_LOOKAHEAD >= M. STBL_PREFETCH2=M2 also reads the top M2 of the
 // layer after next (its router on this layer's FFN input), queued behind the next layer's.
 // STBL_READ_THREADS=N (default 4) reads the missing experts of a layer in 2 MiB pieces with N threads.
@@ -508,19 +508,35 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
     const uint64_t up = l.exp_bytes[0], down = l.exp_bytes[0] + l.exp_bytes[1];
     // expert i's output goes to moe_eo[i]; the outputs are added in top-k order at the end, so queueing
     // the cached experts and the shared expert before the reads finish does not change the sums
-    auto run_expert = [&](int i) {
-        float w = sc[order[i]];
-        w /= sum + 1e-20f;
-        w *= c.route_scale;
-        stbl_gemv_mxfp4(m->moe_g, ew[i], m->moe_xq, c.inter, c.dim, m->st);
-        stbl_gemv_mxfp4(m->moe_u, ew[i] + up, m->moe_xq, c.inter, c.dim, m->st);
-        stbl_swiglu(m->moe_mid, m->moe_g, m->moe_u, w, c.swiglu_limit, c.inter, m->st);
-        stbl_act_quant_fp8(m->moe_mid, c.inter, m->st);
-        stbl_gemv_mxfp4(m->moe_eo + (size_t)i * c.dim, ew[i] + down, m->moe_mid, c.dim, c.inter, m->st);
+    // the experts with missing[i] == want, batched: gate and up in one launch, then SwiGLU, quantization
+    // and down, each in one launch; every row is computed as it would be one expert at a time
+    auto run_experts = [&](bool want) {
+        std::vector<int> idx;
+        for (int i = 0; i < c.topk; i++)
+            if ((bool)missing[i] == want) idx.push_back(i);
+        const int n = (int)idx.size();
+        if (n == 0) return;
+        std::vector<float *> y(2 * n), yd(n);
+        std::vector<const void *> w(2 * n), wd(n);
+        std::vector<const float *> xs(2 * n, m->moe_xq), xd(n);
+        std::vector<float> ws(n);
+        for (int j = 0; j < n; j++) {
+            const int i = idx[j];
+            float wt = sc[order[i]];
+            wt /= sum + 1e-20f;
+            wt *= c.route_scale;
+            ws[j] = wt;
+            y[j] = m->moe_g + (size_t)j * c.inter, w[j] = ew[i];
+            y[n + j] = m->moe_u + (size_t)j * c.inter, w[n + j] = ew[i] + up;
+            yd[j] = m->moe_eo + (size_t)i * c.dim, wd[j] = ew[i] + down, xd[j] = m->moe_mid + (size_t)j * c.inter;
+        }
+        stbl_gemv_mxfp4_batch(y.data(), w.data(), xs.data(), 2 * n, c.inter, c.dim, m->st);
+        stbl_swiglu_batch(m->moe_mid, m->moe_g, m->moe_u, ws.data(), n, c.swiglu_limit, c.inter, m->st);
+        stbl_act_quant_fp8(m->moe_mid, n * c.inter, m->st);
+        stbl_gemv_mxfp4_batch(yd.data(), wd.data(), xd.data(), n, c.dim, c.inter, m->st);
     };
     mark(m, T_EXPERT);
-    for (int i = 0; i < c.topk; i++)
-        if (!missing[i]) run_expert(i);
+    run_experts(false);
     mark(m, T_SHARED);
     gemv(m, l.sh_w1, m->moe_g, x, true);
     gemv(m, l.sh_w3, m->moe_u, x, true);
@@ -566,9 +582,7 @@ void moe(stbl_model *m, int il, const float *x, float *out) {
         m->pf_cv.notify_all();
     }
     mark(m, T_EXPERT);
-    for (int i = 0; i < c.topk; i++) {
-        if (missing[i]) run_expert(i);
-    }
+    run_experts(true);
     for (int i = 0; i < c.topk; i++) stbl_axpy(m->moe_y, m->moe_eo + (size_t)i * c.dim, 1.f, c.dim, m->st);
     stbl_axpy(m->moe_y, m->moe_out, 1.f, c.dim, m->st);
     CK(cudaMemcpyAsync(out, m->moe_y, (size_t)c.dim * 4, cudaMemcpyDeviceToDevice, m->st));
@@ -981,19 +995,20 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->latent = dalloc(c.head_dim); m->kbuf = dalloc(c.idim); m->o = dalloc(qd);
     m->low = dalloc((size_t)c.o_groups * c.o_rank);
     m->idx_q = dalloc((size_t)c.ih * c.idim); m->idx_w = dalloc(c.ih); m->idx_score = dalloc(ctx);
-    m->router = dalloc(c.experts); m->moe_xq = dalloc(c.dim); m->moe_g = dalloc(c.inter); m->moe_u = dalloc(c.inter);
-    m->moe_mid = dalloc(c.inter); m->moe_out = dalloc(c.dim); m->moe_y = dalloc(c.dim);
+    m->router = dalloc(c.experts); m->moe_xq = dalloc(c.dim); m->moe_g = dalloc((size_t)c.topk * c.inter);
+    m->moe_u = dalloc((size_t)c.topk * c.inter); m->moe_mid = dalloc((size_t)c.topk * c.inter); m->moe_out = dalloc(c.dim); m->moe_y = dalloc(c.dim);
     m->moe_eo = dalloc((size_t)c.topk * c.dim);
+    if (2 * c.topk > kMxBatch) throw std::runtime_error("top-k too large for the batched expert kernels");
     m->router2 = dalloc(c.experts);
     m->router3 = dalloc(c.experts);
     const char *ahead = getenv("STBL_LOOKAHEAD"), *pf = getenv("STBL_PREFETCH");
     m->ahead = ahead && ahead[0] ? atoi(ahead) : 0;
-    m->prefetch = pf && pf[0] ? atoi(pf) : 0;
+    m->prefetch = pf && pf[0] ? atoi(pf) : 8;
     const char *pf2 = getenv("STBL_PREFETCH2");
     m->prefetch2 = m->prefetch > 0 && pf2 && pf2[0] ? atoi(pf2) : 0;
     m->ahead = std::max(m->ahead, m->prefetch);
     const char *pt = getenv("STBL_PREFETCH_THREADS");
-    const int pf_readers = m->prefetch > 0 ? std::max(1, std::min(pt && pt[0] ? atoi(pt) : 4, 16)) : 0;
+    const int pf_readers = m->prefetch > 0 ? std::max(1, std::min(pt && pt[0] ? atoi(pt) : 8, 16)) : 0;
     for (int t = 0; t < pf_readers; t++) m->pf_threads.emplace_back(prefetch_worker, m);
     m->eng_vals = dalloc(64 * 256); m->eng_kv = dalloc((size_t)(c.hc + 1) * c.dim);
     m->logits = dalloc(c.vocab);

@@ -112,11 +112,21 @@ __global__ void k_gemv_fp8(float *y, const uint8_t *w, const uint8_t *scale, con
 // the result matches the validated one-warp-per-block kernel bit for bit. Needs k % 256 == 0 and w
 // 8-byte aligned, so that every row and every 32-block chunk starts 8-byte aligned. The value table
 // sits in shared memory: lanes index it with different codes, which constant memory would serialize.
-__global__ void k_gemv_mxfp4(float *y, const uint8_t *w, const float *x, int rows, int k) {
+// Matrix blockIdx.y of the batch: y = W x, all of the same shape.
+struct MxBatch {
+    float *y[kMxBatch];
+    const uint8_t *w[kMxBatch];
+    const float *x[kMxBatch];
+};
+
+__global__ void k_gemv_mxfp4(MxBatch b, int rows, int k) {
     __shared__ uint2 stage[8][68];
     __shared__ float fp4[16];
     if (threadIdx.x < 16) fp4[threadIdx.x] = kFp4[threadIdx.x];
     __syncthreads();
+    float *y = b.y[blockIdx.y];
+    const uint8_t *w = b.w[blockIdx.y];
+    const float *x = b.x[blockIdx.y];
     const int warp = threadIdx.x / 32, lane = threadIdx.x & 31, r = blockIdx.x * 8 + warp;
     if (r >= rows) return;
     const int nblk = k / 32;
@@ -350,9 +360,17 @@ __global__ void k_sqrt_softplus(float *s, int n) {
 }
 
 // SwiGLU with the training clamps: out = bf16(silu(min(g, lim)) * clamp(u, -lim, lim) * w).
-__global__ void k_swiglu(float *out, const float *g, const float *u, float weight, float limit, int n) {
+struct Weights {
+    float w[kMxBatch];
+};
+
+// Segment blockIdx.y of `count` consecutive n-long segments, scaled by weights.w[blockIdx.y].
+__global__ void k_swiglu(float *out, const float *g, const float *u, Weights weights, float limit, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    const float weight = weights.w[blockIdx.y];
+    const size_t at = (size_t)blockIdx.y * n;
+    out += at, g += at, u += at;
     float gv = g[i], uv = u[i];
     if (limit > 0) { uv = fminf(fmaxf(uv, -limit), limit); gv = fminf(gv, limit); }
     out[i] = bf16r(gv / (1.f + expf(-gv)) * uv * weight);
@@ -461,7 +479,13 @@ void stbl_gemv_fp8(float *y, const void *w, const void *scale, const float *x, i
     k_gemv_fp8<<<GRID(rows, 8), 256, 0, st>>>(y, (const uint8_t *)w, (const uint8_t *)scale, x, rows, k, round_out);
 }
 void stbl_gemv_mxfp4(float *y, const void *w, const float *x, int rows, int k, cudaStream_t st) {
-    k_gemv_mxfp4<<<GRID(rows, 8), 256, 0, st>>>(y, (const uint8_t *)w, x, rows, k);
+    stbl_gemv_mxfp4_batch(&y, &w, &x, 1, rows, k, st);
+}
+void stbl_gemv_mxfp4_batch(float *const *y, const void *const *w, const float *const *x, int n, int rows, int k,
+                           cudaStream_t st) {
+    MxBatch b;
+    for (int j = 0; j < n; j++) b.y[j] = y[j], b.w[j] = (const uint8_t *)w[j], b.x[j] = x[j];
+    k_gemv_mxfp4<<<dim3(GRID(rows, 8), n), 256, 0, st>>>(b, rows, k);
 }
 void stbl_gemv_bf16(float *y, const void *w, const float *x, int rows, int k, int round_out, int group_rows,
                     cudaStream_t st) {
@@ -511,7 +535,13 @@ void stbl_sparse_attn(float *out, const float *q, const float *kv1, int n1, cons
 }
 void stbl_sqrt_softplus(float *s, int n, cudaStream_t st) { k_sqrt_softplus<<<GRID(n, 256), 256, 0, st>>>(s, n); }
 void stbl_swiglu(float *out, const float *g, const float *u, float weight, float limit, int n, cudaStream_t st) {
-    k_swiglu<<<GRID(n, 256), 256, 0, st>>>(out, g, u, weight, limit, n);
+    stbl_swiglu_batch(out, g, u, &weight, 1, limit, n, st);
+}
+void stbl_swiglu_batch(float *out, const float *g, const float *u, const float *weights, int count, float limit, int n,
+                       cudaStream_t st) {
+    Weights ws;
+    for (int j = 0; j < count; j++) ws.w[j] = weights[j];
+    k_swiglu<<<dim3(GRID(n, 256), count), 256, 0, st>>>(out, g, u, ws, limit, n);
 }
 void stbl_axpy(float *y, const float *x, float a, int n, cudaStream_t st) {
     k_axpy<<<GRID(n, 256), 256, 0, st>>>(y, x, a, n);

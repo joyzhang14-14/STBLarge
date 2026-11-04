@@ -14,6 +14,10 @@ void stbl_scale_bf16(float *x, float a, int n, cudaStream_t st);
 void stbl_gemv_fp8(float *y, const void *w, const void *scale, const float *x, int rows, int k, int round_out,
                    cudaStream_t st);
 void stbl_gemv_mxfp4(float *y, const void *w, const float *x, int rows, int k, cudaStream_t st);
+// n <= kMxBatch matrices of one shape in one launch, each computed as by stbl_gemv_mxfp4.
+enum { kMxBatch = 16 };
+void stbl_gemv_mxfp4_batch(float *const *y, const void *const *w, const float *const *x, int n, int rows, int k,
+                           cudaStream_t st);
 void stbl_gemv_bf16(float *y, const void *w, const float *x, int rows, int k, int round_out, int group_rows,
                     cudaStream_t st);
 void stbl_gemv_f32(float *y, const float *w, const float *x, int rows, int k, int round_out, cudaStream_t st);
@@ -29,6 +33,9 @@ void stbl_sparse_attn(float *out, const float *q, const float *kv1, int n1, cons
                       int n_idx, const float *sink, int heads, int d, float scale, cudaStream_t st);
 void stbl_sqrt_softplus(float *s, int n, cudaStream_t st);
 void stbl_swiglu(float *out, const float *g, const float *u, float weight, float limit, int n, cudaStream_t st);
+// count <= kMxBatch consecutive n-long segments, segment j scaled by weights[j].
+void stbl_swiglu_batch(float *out, const float *g, const float *u, const float *weights, int count, float limit, int n,
+                       cudaStream_t st);
 void stbl_axpy(float *y, const float *x, float a, int n, cudaStream_t st);
 void stbl_embed(float *h, const void *table, int token, int dim, int hc, cudaStream_t st);
 void stbl_engram_rows(float *out, const void *rows, int n_rows, cudaStream_t st);
