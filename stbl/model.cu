@@ -6,7 +6,8 @@
 // STBL_LOOKAHEAD=M scores the next layer's router on this layer's FFN input (the stale-router guess) and
 // counts how many of its top M would have covered the next layer's expert misses (stbl_lookahead).
 // STBL_PREFETCH=M reads the uncached ones of that guess's top M into cache slots in the background, so
-// the next layer finds them; reads the current layer is waiting for go first. Implies STBL_LOOKAHEAD >= M.
+// the next layer finds them, with STBL_PREFETCH_THREADS (default 4) readers; reads the current layer is
+// waiting for go first. Implies STBL_LOOKAHEAD >= M.
 // STBL_READ_THREADS=N (default 4) reads the missing experts of a layer in 2 MiB pieces with N threads.
 // STBL_TIMING=1 syncs the stream at every section boundary and adds the wall time to per-section
 // totals (stbl_timing); it slows decoding down and serializes the expert reads with the GPU work they
@@ -966,7 +967,9 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
     m->ahead = ahead && ahead[0] ? atoi(ahead) : 0;
     m->prefetch = pf && pf[0] ? atoi(pf) : 0;
     m->ahead = std::max(m->ahead, m->prefetch);
-    for (int t = 0; t < (m->prefetch > 0 ? 4 : 0); t++) m->pf_threads.emplace_back(prefetch_worker, m);
+    const char *pt = getenv("STBL_PREFETCH_THREADS");
+    const int pf_readers = m->prefetch > 0 ? std::max(1, std::min(pt && pt[0] ? atoi(pt) : 4, 16)) : 0;
+    for (int t = 0; t < pf_readers; t++) m->pf_threads.emplace_back(prefetch_worker, m);
     m->eng_vals = dalloc(64 * 256); m->eng_kv = dalloc((size_t)(c.hc + 1) * c.dim);
     m->logits = dalloc(c.vocab);
     CK(cudaMalloc(&m->attn_idx, (size_t)(c.window + c.index_topk + 8) * sizeof(int)));
