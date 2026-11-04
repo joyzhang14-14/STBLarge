@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <list>
 #include <numeric>
 #include <stdexcept>
@@ -93,7 +94,8 @@ struct stbl_model {
     std::vector<uint64_t> token_map, primes, mult;
     int eng_pad = 0, eng_heads = 0, eng_ngram = 0;
     std::vector<int64_t> history;
-    uint8_t *eng_stage = nullptr;
+    uint8_t *eng_stage = nullptr;  // [engram layer][64 rows][264 bytes]
+    std::future<void> eng_read;     // this token's rows of every engram layer, read at the token's start
     // rope tables [ctx][rope/2][cos, sin]
     float *rope_plain = nullptr, *rope_comp = nullptr;
     // activations
@@ -473,11 +475,9 @@ void attention(stbl_model *m, int il, const float *x, float *out) {
 
 // ---- Engram ----------------------------------------------------------------------------------------
 
-void engram(stbl_model *m, int il) {
-    const Cfg &c = m->c;
-    Layer &l = m->L[il];
-    const int li = l.engram, n = (int)m->history.size() - 1;  // n = current position
-    mark(m, T_ENGRAM);
+// Table rows of engram layer li for the current position.
+std::vector<int64_t> engram_rows(const stbl_model *m, int li) {
+    const int n = (int)m->history.size() - 1;  // n = current position
     const int per_layer = (m->eng_ngram - 1) * m->eng_heads;
     std::vector<int64_t> rows(per_layer);
     uint64_t rolling = 0;
@@ -494,14 +494,48 @@ void engram(stbl_model *m, int il) {
             rows[j] = (int64_t)(rolling % p + off);
         }
     }
-    for (int j = 0; j < per_layer; j++)
-        if (pread(m->f.fd, m->eng_stage + (size_t)j * 264, 264, (off_t)(l.eng_rows_off + (uint64_t)rows[j] * 264)) != 264)
-            throw std::runtime_error("engram row read failed");
-    CK(cudaMemcpyAsync(m->sub, m->eng_stage, (size_t)per_layer * 264, cudaMemcpyHostToDevice, m->st));
+    return rows;
+}
+
+// Reads the current position's rows of every engram layer into eng_stage, with 8 threads: the rows
+// depend only on the tokens, so this runs while the GPU works through the layers before them.
+void read_engram(stbl_model *m) {
+    struct Row {
+        uint8_t *dst;
+        uint64_t off;
+    };
+    std::vector<Row> todo;
+    for (int li = 0; li < (int)m->eng_layers.size(); li++) {
+        const std::vector<int64_t> rows = engram_rows(m, li);
+        const uint64_t base = m->L[m->eng_layers[li]].eng_rows_off;
+        for (size_t j = 0; j < rows.size(); j++)
+            todo.push_back({m->eng_stage + ((size_t)li * 64 + j) * 264, base + (uint64_t)rows[j] * 264});
+    }
+    std::atomic<size_t> next{0};
+    std::atomic<bool> ok{true};
+    auto work = [&] {
+        for (size_t j; ok && (j = next++) < todo.size();)
+            if (pread(m->f.fd, todo[j].dst, 264, (off_t)todo[j].off) != 264) ok = false;
+    };
+    std::vector<std::thread> pool;
+    for (int t = 0; t < 8; t++) pool.emplace_back(work);
+    for (auto &t : pool) t.join();
+    if (!ok) throw std::runtime_error("engram row read failed");
+}
+
+void engram(stbl_model *m, int il) {
+    const Cfg &c = m->c;
+    Layer &l = m->L[il];
+    const int li = l.engram;
+    mark(m, T_ENGRAM);
+    const int per_layer = (m->eng_ngram - 1) * m->eng_heads;
+    if (m->eng_read.valid()) m->eng_read.get();  // rethrows a failed read
+    CK(cudaMemcpyAsync(m->sub, m->eng_stage + (size_t)li * 64 * 264, (size_t)per_layer * 264, cudaMemcpyHostToDevice,
+                       m->st));
     stbl_engram_rows(m->eng_vals, m->sub, per_layer, m->st);
     gemv(m, l.eng_kv, m->eng_kv, m->eng_vals, true);
     stbl_engram_gate(m->h, m->eng_kv, l.eng_q, l.eng_k, c.dim, c.hc, c.eps, m->st);
-    CK(cudaStreamSynchronize(m->st));  // eng_stage is reused next time
+    CK(cudaStreamSynchronize(m->st));  // eng_stage is reused next token
     mark(m, T_HC);
 }
 
@@ -535,6 +569,7 @@ int forward(stbl_model *m, int token, float *logits_out) {
     if (m->pos >= m->ctx) throw std::runtime_error("context full");
     if (token < 0 || token >= c.vocab) throw std::runtime_error("token out of range");
     m->history.push_back((int64_t)m->token_map[token]);
+    if (!m->eng_layers.empty()) m->eng_read = std::async(std::launch::async, read_engram, m);
     stbl_embed(m->h, m->embed, token, c.dim, c.hc, m->st);
     const float one_hot[4] = {1.f, 0.f, 0.f, 0.f};
     CK(cudaMemcpyAsync(m->pre_mix, one_hot, sizeof(one_hot), cudaMemcpyHostToDevice, m->st));
@@ -706,7 +741,8 @@ void load(stbl_model *m, const char *path, int ctx, int slots) {
         CK(cudaStreamCreateWithFlags(&m->rstream[w], cudaStreamNonBlocking));
     }
     m->dfd = open(path, O_RDONLY | O_DIRECT);  // -1 (buffered reads) where the file system refuses it
-    CK(cudaMallocHost(&m->eng_stage, 64 * 264));
+    if ((m->eng_ngram - 1) * m->eng_heads > 64) throw std::runtime_error("too many engram rows per layer");
+    CK(cudaMallocHost(&m->eng_stage, std::max<size_t>(m->eng_layers.size(), 1) * 64 * 264));
 
     const size_t n = (size_t)c.hc * c.dim, qd = (size_t)c.heads * c.head_dim;
     m->h = dalloc(n); m->h2 = dalloc(n); m->res = dalloc(n);
@@ -779,7 +815,10 @@ int stbl_block_test(stbl_model *m, int il, int pos, int token, const float *h_in
         }
         CK(cudaMemcpyAsync(m->h, h_in, n * 4, cudaMemcpyHostToDevice, m->st));
         CK(cudaMemcpyAsync(m->pre_mix, pre_in, (size_t)c.hc * 4, cudaMemcpyHostToDevice, m->st));
-        if (m->L[il].engram >= 0 && stage != 2) engram(m, il);
+        if (m->L[il].engram >= 0 && stage != 2) {
+            read_engram(m);
+            engram(m, il);
+        }
         if (stage != 1) block(m, il);
         CK(cudaStreamSynchronize(m->st));
         CK(cudaMemcpy(h_out, m->h, n * 4, cudaMemcpyDeviceToHost));
