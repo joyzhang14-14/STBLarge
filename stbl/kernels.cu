@@ -106,18 +106,41 @@ __global__ void k_gemv_fp8(float *y, const uint8_t *w, const uint8_t *scale, con
 }
 
 // MXFP4 rows as GGUF blocks of 17 bytes: E8M0 scale, then 16 bytes holding values 0..15 in the low
-// nibbles and 16..31 in the high nibbles.
+// nibbles and 16..31 in the high nibbles. One warp per row: the warp stages 32 blocks (544 bytes) at a
+// time in shared memory with 8-byte loads, then each lane sums one block. Needs k % 256 == 0 and w
+// 8-byte aligned, so that every row and every 32-block chunk starts 8-byte aligned. The value table
+// sits in shared memory: lanes index it with different codes, which constant memory would serialize.
 __global__ void k_gemv_mxfp4(float *y, const uint8_t *w, const float *x, int rows, int k) {
-    const int r = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    __shared__ uint2 stage[8][68];
+    __shared__ float fp4[16];
+    if (threadIdx.x < 16) fp4[threadIdx.x] = kFp4[threadIdx.x];
+    __syncthreads();
+    const int warp = threadIdx.x / 32, lane = threadIdx.x & 31, r = blockIdx.x * 8 + warp;
     if (r >= rows) return;
-    const uint8_t *wr = w + (size_t)r * (k / 32) * 17;
+    const int nblk = k / 32;
+    const uint8_t *wr = w + (size_t)r * nblk * 17;
+    const uint8_t *sb = (const uint8_t *)stage[warp];
     float acc = 0.f;
-    for (int kb = 0; kb < k / 32; kb++) {
-        const uint8_t *blk = wr + kb * 17;
-        const uint8_t byte = blk[1 + (lane & 15)];
-        const float v = kFp4[lane < 16 ? (byte & 15) : (byte >> 4)];
-        acc += warp_sum(x[kb * 32 + lane] * v) * e8m0(blk[0]);
+    for (int kb0 = 0; kb0 < nblk; kb0 += 32) {
+        const int nb = min(32, nblk - kb0), words = nb * 17 / 8;
+        const uint2 *src = (const uint2 *)(wr + (size_t)kb0 * 17);
+        for (int i = lane; i < words; i += 32) stage[warp][i] = src[i];
+        __syncwarp();
+        if (lane < nb) {
+            const uint8_t *blk = sb + lane * 17;
+            const float4 *xv = (const float4 *)(x + (size_t)(kb0 + lane) * 32);
+            float s = 0.f;
+            for (int q = 0; q < 4; q++) {
+                const float4 lo = xv[q], hi = xv[q + 4];
+                const uint8_t b0 = blk[1 + q * 4], b1 = blk[2 + q * 4], b2 = blk[3 + q * 4], b3 = blk[4 + q * 4];
+                s += lo.x * fp4[b0 & 15] + lo.y * fp4[b1 & 15] + lo.z * fp4[b2 & 15] + lo.w * fp4[b3 & 15];
+                s += hi.x * fp4[b0 >> 4] + hi.y * fp4[b1 >> 4] + hi.z * fp4[b2 >> 4] + hi.w * fp4[b3 >> 4];
+            }
+            acc += s * e8m0(blk[0]);
+        }
+        __syncwarp();
     }
+    acc = warp_sum(acc);
     if (lane == 0) y[r] = bf16r(acc);
 }
 
