@@ -61,12 +61,6 @@ def bench_copy():
     report("device copy 64 MiB (read+write)", *timed(lambda: b.copy_(a), 2 * a.numel(), 50))
 
 
-bench_copy()
-bench_mxfp4(INTER, DIM)
-bench_mxfp4(DIM, INTER)
-bench_fp8(INTER, DIM)
-bench_fp8(DIM, INTER)
-bench_bf16(4096, DIM)
 
 
 def bench_hc_mixes(hc=4, iters=20):
@@ -80,4 +74,37 @@ def bench_hc_mixes(hc=4, iters=20):
                                                               I(hc), I(DIM), I(iters), Fl(1e-6), Fl(1e-6), None), fn.numel() * 4))
 
 
-bench_hc_mixes()
+
+
+def bench_bf16_grouped(rows=8192, k=4096, group_rows=1024):
+    w = torch.randn(rows, k, device=dev).to(torch.bfloat16)
+    x = torch.randn(rows // group_rows * k, device=dev)
+    y = torch.empty(rows, device=dev)
+    report(f"gemv_bf16 grouped {rows}x{k}", *timed(lambda: lib.stbl_gemv_bf16(P(y.data_ptr()), P(w.data_ptr()), P(x.data_ptr()), I(rows), I(k), I(1), I(group_rows), None), w.numel() * 2))
+
+
+def bench_sparse_attn(n_idx, heads=64, d=512, window=128):
+    q = torch.randn(heads * d, device=dev)
+    kv = torch.randn(window + 4096, d, device=dev)
+    idx = torch.arange(n_idx, device=dev, dtype=torch.int32)
+    sink = torch.zeros(heads, device=dev)
+    out = torch.empty(heads * d, device=dev)
+    report(f"sparse_attn n_idx={n_idx}", *timed(lambda: lib.stbl_sparse_attn(P(out.data_ptr()), P(q.data_ptr()), P(kv.data_ptr()), I(window), P(kv[window:].data_ptr()), P(idx.data_ptr()), I(n_idx), P(sink.data_ptr()), I(heads), I(d), ctypes.c_float(0.044), None), n_idx * d * 4))
+
+
+if __name__ == "__main__":
+    bench_copy()
+    bench_mxfp4(INTER, DIM)
+    bench_mxfp4(DIM, INTER)
+    bench_fp8(INTER, DIM)
+    bench_fp8(DIM, INTER)
+    bench_bf16(4096, DIM)
+    bench_hc_mixes()
+    print("-- attention shapes")
+    bench_fp8(32768, 1280)
+    bench_fp8(5120, 8192)
+    bench_fp8(1280, 5120)
+    bench_fp8(512, 5120)
+    bench_bf16_grouped()
+    for n in (128, 256, 640):
+        bench_sparse_attn(n)

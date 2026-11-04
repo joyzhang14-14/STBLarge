@@ -1,4 +1,7 @@
-"""Bitwise comparison of the new MXFP4 GEMV / hc_mixes kernels with the old ones (random inputs)."""
+"""Bitwise comparison of kernels in two builds of libstbl.so (MXFP4 GEMV, hc_mixes, sparse_attn), random inputs.
+
+usage: cmp_kernels.py NEW.so OLD.so   (seconds, under 1 GB: may run outside an stb task)
+"""
 import ctypes, sys
 import torch
 new = ctypes.CDLL(sys.argv[1]); old = ctypes.CDLL(sys.argv[2])
@@ -31,4 +34,18 @@ for seed in range(20):
         torch.cuda.synchronize(); outs.append(torch.cat([pre, post, comb]))
     d = (outs[0] != outs[1]).sum().item(); bad += d
     if d: print(f"hc_mixes seed {seed}: {d} values differ")
+    heads, d, window = 64, 512, 128
+    for n_idx in (13, 128, 300, 640):
+        q = torch.randn(heads * d, device=dev).bfloat16().float()
+        kv = torch.randn(window + 2048, d, device=dev).bfloat16().float()
+        idx = torch.randint(0, window + 2048, (n_idx,), device=dev, dtype=torch.int32)
+        idx[torch.rand(n_idx, device=dev) < 0.05] = -1
+        sink = torch.randn(heads, device=dev)
+        outs = []
+        for lib in (new, old):
+            o = torch.empty(heads * d, device=dev)
+            lib.stbl_sparse_attn(p(o), p(q), p(kv), I(window), P(kv[window:].data_ptr()), p(idx), I(n_idx), p(sink), I(heads), I(d), F(0.044), None)
+            torch.cuda.synchronize(); outs.append(o)
+        dd = (outs[0] != outs[1]).sum().item(); bad += dd
+        if dd: print(f"sparse_attn seed {seed} n_idx {n_idx}: {dd} values differ")
 print("bitwise identical" if bad == 0 else f"{bad} differences")
