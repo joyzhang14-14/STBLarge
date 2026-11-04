@@ -91,16 +91,42 @@ __global__ void k_round_bf16(float *x, int n) {
 // ---- GEMV ---------------------------------------------------------------------------------------
 // y[r] = sum_k x[k] * W[r][k]. One warp per output row; 8 rows per 256-thread block.
 
+// Each lane takes one 32-value block at a time (two 16-byte loads) and adds its products by the
+// xor-butterfly tree; the warp adds the block sums in block order. These are the additions of one
+// warp per block (products summed by warp_sum, block sums added in order), bit for bit. Needs k % 32 == 0
+// and 16-byte aligned rows (k % 16 == 0, w 16-byte aligned).
 __global__ void k_gemv_fp8(float *y, const uint8_t *w, const uint8_t *scale, const float *x,
                            int rows, int k, int round_out) {
     const int r = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x & 31;
     if (r >= rows) return;
     const uint8_t *wr = w + (size_t)r * k;
     const uint8_t *sr = scale + (size_t)(r / 32) * (k / 32);
+    const int nblk = k / 32;
     float acc = 0.f;
-    for (int kb = 0; kb < k / 32; kb++) {
-        const float p = x[kb * 32 + lane] * e4m3_value(wr[kb * 32 + lane]);
-        acc += warp_sum(p) * e8m0(sr[kb]);
+    for (int kb0 = 0; kb0 < nblk; kb0 += 32) {
+        const int nb = min(32, nblk - kb0);
+        float bs = 0.f;
+        if (lane < nb) {
+            const int kb = kb0 + lane;
+            const uint4 w0 = ((const uint4 *)(wr + (size_t)kb * 32))[0], w1 = ((const uint4 *)(wr + (size_t)kb * 32))[1];
+            const uint32_t wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            const float4 *xv = (const float4 *)(x + (size_t)kb * 32);
+            float p[32];
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const float4 xq = xv[q];
+                p[q * 4] = __fmul_rn(xq.x, e4m3_value(wv[q] & 0xff));
+                p[q * 4 + 1] = __fmul_rn(xq.y, e4m3_value((wv[q] >> 8) & 0xff));
+                p[q * 4 + 2] = __fmul_rn(xq.z, e4m3_value((wv[q] >> 16) & 0xff));
+                p[q * 4 + 3] = __fmul_rn(xq.w, e4m3_value(wv[q] >> 24));
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int i = 0; i < o; i++) p[i] = __fadd_rn(p[i], p[i + o]);
+            bs = p[0] * e8m0(sr[kb]);  // exact: the scale is a power of two
+        }
+        for (int b = 0; b < nb; b++) acc = __fadd_rn(acc, __shfl_sync(0xffffffffu, bs, b));
     }
     if (lane == 0) y[r] = round_out ? bf16r(acc) : acc;
 }

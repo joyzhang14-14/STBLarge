@@ -1,4 +1,4 @@
-"""Bitwise comparison of kernels in two builds of libstbl.so (MXFP4 GEMV, hc_mixes, sparse_attn), random inputs.
+"""Bitwise comparison of kernels in two builds of libstbl.so (MXFP4 / FP8 GEMV, hc_mixes, sparse_attn), random inputs.
 
 usage: cmp_kernels.py NEW.so OLD.so   (seconds, under 1 GB: may run outside an stb task)
 """
@@ -34,6 +34,19 @@ for seed in range(20):
         torch.cuda.synchronize(); outs.append(torch.cat([pre, post, comb]))
     d = (outs[0] != outs[1]).sum().item(); bad += d
     if d: print(f"hc_mixes seed {seed}: {d} values differ")
+    for rows, k in ((32768, 1280), (5120, 8192), (512, 5120), (2304, 5120), (5120, 2304)):
+        w = torch.randint(0, 256, (rows, k), device=dev, dtype=torch.uint8)
+        w[(w & 0x7f) == 0x7f] = 0  # no NaN codes
+        sc = torch.randint(110, 130, ((rows + 31) // 32, k // 32), device=dev, dtype=torch.uint8)
+        x = torch.randn(k, device=dev).bfloat16().float() * (10 ** torch.empty(k, device=dev).uniform_(-2, 1))
+        new.stbl_act_quant_fp8(p(x), I(k), None)
+        outs = []
+        for lib in (new, old):
+            o = torch.empty(rows, device=dev)
+            lib.stbl_gemv_fp8(p(o), p(w), p(sc), p(x), I(rows), I(k), I(seed % 2), None)
+            torch.cuda.synchronize(); outs.append(o)
+        dd = (outs[0] != outs[1]).sum().item(); bad += dd
+        if dd: print(f"fp8 seed {seed} {rows}x{k}: {dd} rows differ")
     heads, d, window = 64, 512, 128
     for n_idx in (13, 128, 300, 640):
         q = torch.randn(heads * d, device=dev).bfloat16().float()
